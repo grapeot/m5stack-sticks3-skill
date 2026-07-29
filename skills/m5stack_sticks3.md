@@ -37,10 +37,10 @@ M5StickS3 是 M5Stack Stick 系列的最新产品，但它和前代 StickC/Plus/
 |------|------|------|
 | IR_TX | 46 | IR LED 发射 |
 | IR_RX | 42 | IR 接收器, 必须 RMT 驱动 |
-| BtnA | 11 | 侧键，wasPressed/wasHold/wasDoubleClicked |
+| BtnA | 11 | 正面 M5 主按键，wasPressed/wasHold/wasDoubleClicked |
 | BtnB | 12 | 侧键 |
 | PWR | M5PM1 | 电源键，硬件级，短按重启 |
-| BOOT | 0 | 开机时 ROM 检测，运行时普通 GPIO |
+| BOOT | 0 | ROM strap；由板级下载控制使用，不当作普通空闲 GPIO |
 | LCD MOSI | 39 | |
 | LCD SCK | 40 | |
 | LCD RS | 45 | |
@@ -75,6 +75,12 @@ arduino-cli lib install M5GFX
 StickS3 的 board 定义只在 M5Stack 自己的 board package 里。espressif 官方的 `esp32:esp32` core **没有** StickS3 board。两个 package 是独立的：
 - `esp32:esp32` — Espressif 官方，有 ESP32-S3 DevKit 等通用板
 - `m5stack:esp32` — M5Stack 定制，有 StickS3、Cardputer 等 M5 板
+
+这条只针对 **Arduino CLI 的板型选择**。StickS3 同样支持 ESP-IDF 和
+PlatformIO；它们没有 M5Stack 专用 FQBN，分别使用 target `esp32s3` 或通用
+`esp32-s3-devkitc-1` 配置。无论使用哪种框架，8MB PSRAM 都是 **Octal/OPI**，
+不能误配成 Quad/QSPI。Arduino 的 `m5stack_sticks3` board 默认已选好这项；
+PlatformIO/ESP-IDF 项目必须显式核对。
 
 ### FQBN
 
@@ -120,7 +126,7 @@ arduino-cli upload \
 
 ### 端口
 
-macOS 上设备显示为 `/dev/cu.usbmodem101` 和 `/dev/tty.usbmodem101`。USB Product Name 是 `StickS3_UiFlow2_`，Vendor 是 `M5Stack` (0x303A)。
+macOS 上设备通常显示为 `/dev/cu.usbmodem*` 和 `/dev/tty.usbmodem*`；数字后缀由系统动态分配，不能写死为 `101`。官方 board 默认 USB VID:PID 为 `303A:1001`、manufacturer 为 `M5Stack`、product 为 `StickS3`；已刷的其他固件可能改写 USB Product Name。
 
 ## 按钮系统（核心踩坑区）
 
@@ -158,7 +164,7 @@ BtnB 的 API 完全相同，把 `BtnA` 换成 `BtnB`。
 - **短按 PWR 会触发硬件复位**，固件无法拦截。这不是固件 bug，是 M5PM1 的硬件行为。
 - 双击 PWR = 硬件关机。
 
-**结论：不要用 PWR 键做 UI 操作。** 只用 BtnA 和 BtnB。如果需要选择/确认/返回，用短按和双击/长按组合。
+**结论：不要用 PWR 键做 UI 操作。** 只用 BtnA 和 BtnB。如果需要选择/确认/返回，用短按和双击/长按组合。这个 skill 的默认安全边界是：不改写 M5PM1 对 PWR 的复位、关机和下载模式默认动作；它是设备从固件卡死中恢复的最后路径。
 
 ### 推荐按钮映射方案
 
@@ -201,8 +207,16 @@ M5.begin(cfg);
 // 方法 2：在 M5.begin 之后关闭
 M5.Speaker.end();
 
-// 双保险：两个都写
+// M5Unified 默认关闭 EXT_5V，内置 IR TX/RX 因此也没有供电。
+// 无外部 5V 输入时必须重新开启。
+M5.Power.setExtOutput(true, m5::ext_none);
+
+// 双保险：两个关闭功放步骤都写
 ```
+
+仅关闭功放不足以让 IR 工作：M5Unified 默认初始化会关闭 Grove、Hat EXT_5V
+以及内置 IR TX/RX 的供电。使用 IR 收发前应显式调用
+`M5.Power.setExtOutput(true, m5::ext_none)`。
 
 ### RMT 外设驱动
 
@@ -263,7 +277,9 @@ bool rx_callback(rmt_channel_handle_t chan, const rmt_rx_done_event_data_t *edat
 }
 ```
 
-回调返回 `false`，不是 `true`。返回值表示"是否需要 ISR 后 task scheduling"，不是"是否成功"。
+返回值表示"是否需要 ISR 后调度已被唤醒的高优先级 task"，不是"是否成功"。当前
+回调只写 `volatile` 标志、不唤醒 task 时返回 `false`；如果回调通过
+`...FromISR` queue/semaphore API 唤醒了更高优先级 task，则返回对应的 wake 标志。
 
 #### 启动接收
 
@@ -339,7 +355,9 @@ StickS3 内置 250mAh 电池。**拔 USB 不会断电**（电池供电），所�
 3. 插上 USB
 4. 松开 BOOT 键
 
-设备停在 ROM bootloader，屏幕无显示，绿灯可能闪烁。此时 esptool / arduino-cli 可以稳定连接。
+设备停在 ROM bootloader，屏幕无显示。**内部绿灯闪烁是 M5 官方明确的 Download Mode
+成功信号**。此时 esptool / arduino-cli 可以稳定连接。不要把绿灯常亮、熄灭或其他
+节奏解释成应用已正常运行、充电或崩溃：官方没有给出这类状态表。
 
 ### 从 Download Mode 正常启动
 
@@ -454,14 +472,16 @@ Bruce (v1.16) 支持 StickS3 但有多个 bug：
 | 用 espressif 官方 esp32 core | 找不到 StickS3 board 定义 | 用 `m5stack:esp32` board package |
 | FQBN 写成 `m5sticks3` | 编译报 unknown board | 正确是 `m5stack_sticks3`（带前缀） |
 | sketch 放在 `src/foo.ino` | `main file missing from sketch: src/src.ino` | 放在 `src/foo/foo.ino` |
+| PlatformIO / ESP-IDF 把 PSRAM 配成 Quad/QSPI | PSRAM 初始化 panic、黑屏或 boot loop | StickS3 是 8MB Octal/OPI PSRAM；核对 `qio_opi` 或 IDF Octal PSRAM 配置 |
 | 用 PWR 键做 UI | 短按触发硬件复位，设备重启 | 只用 BtnA 和 BtnB |
-| IR RX 不关功放 | 接收到噪声或无信号 | `cfg.internal_spk = false` + `M5.Speaker.end()` |
+| IR RX 不关功放或未开 EXT_5V | 接收到噪声、无信号，或 IR TX/RX 完全不工作 | `cfg.internal_spk = false` + `M5.Speaker.end()` + `M5.Power.setExtOutput(true, m5::ext_none)` |
 | 用旧版 IRremote 库 | 不兼容 ESP32-S3 RMT | 用 `driver/rmt_tx.h` / `driver/rmt_rx.h` |
-| RMT RX callback 返回 true | 不必要的 ISR 调度开销 | 返回 false |
+| RMT RX callback 返回值一律写死 | 误报调度状态或漏掉唤醒 | 只写 volatile 标志时返回 false；用 FromISR API 唤醒高优先级 task 时返回 wake 标志 |
 | NEC 解码用单一阈值 `space > 1000` | 噪声和异常 space 被接受 | 用窗口：0 = 300-1000us, 1 = 1200-2200us |
 | NVS 多次 putULong/putUChar | 断电时可能只写入部分字段 | 用 putBytes 存单个 blob |
 | 拔 USB 后设备不重启 | 电池供电，拔 USB 不断电 | 快速按一下 PWR 键，或拔 USB 后等几秒再插 |
-| 端口频繁消失 | macOS CDC 驱动 + 固件运行时 USB 不稳定 | 按 BOOT 进 download mode 再操作 |
+| 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或当前动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时按 BOOT 进 download mode 再操作 |
+| 将绿灯其他状态当作诊断结论 | 把 PMIC 状态误判为应用正常、充电或崩溃 | 只有“绿灯闪烁 = 已进入 Download Mode”有官方定义；其他灯态不下结论 |
 | drawHeader 不设字体 | 继承前一个屏幕的字体，显示异常 | 封装函数内显式 setFont |
 | 底部文字用大字体 | 超出 135 像素屏幕高度被裁剪 | 底部用 Font0，y 不超过 130 |
 
@@ -470,6 +490,7 @@ Bruce (v1.16) 支持 StickS3 但有多个 bug：
 - M5Stack 官方文档: https://docs.m5stack.com/en/core/StickS3
 - M5Stack IR NEC 例程: https://docs.m5stack.com/en/arduino/m5sticks3/ir_nec
 - M5Unified GitHub: https://github.com/m5stack/M5Unified
+- M5PM1 按键与电源控制: https://github.com/m5stack/M5PM1
 - Bruce 固件: https://bruce.computer
 - Bruce 固件 StickS3 issue: https://github.com/BruceDevices/firmware/issues/2371
 
