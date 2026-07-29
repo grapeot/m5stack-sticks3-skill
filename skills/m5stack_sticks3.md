@@ -409,6 +409,37 @@ M5.Display.printf("Hello");
 - `drawHeader()` 之类的封装函数要**自己设置字体**，否则会继承上一个屏幕的字体
 - 底部文字不要超过 y=130（135 像素高），用 `Font0` 而非 `FreeMonoBold9pt7b` 放底部提示
 
+### ESP-IDF 的 BGR565 颜色
+
+StickS3 的 ST7789P3 通常以 BGR color order 初始化。直接把标准 RGB565 宏产生的像素交给这种 panel 配置时，红蓝通道会互换；最明显的诊断是代码中的蓝色实际显示成红色。裸 `esp_lcd` framebuffer 应按 BGR565 打包：
+
+```c
+#define BGR565(r, g, b) \
+  (((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3))
+```
+
+不要靠逐个修改 palette 值来补偿，这会让颜色命名与实际效果继续错位。先确认 panel 的 `color_space`，再统一修正 pixel packing。
+
+`esp_lcd_panel_draw_bitmap()` 通过 SPI panel IO 提交的 color transfer 是异步的。传入栈数组后立即复用，或传入 heap buffer 后立即 `free()`，DMA 可能继续读取已变化的内存；画面形状往往仍然正确，但颜色会随机变成黄、红等错误值。注册 `on_color_trans_done` callback，用 binary semaphore 等待传输完成后再复用 framebuffer。ESP-IDF 头文件也明确要求在该 callback 后 recycle color buffer。
+
+### 动态 UI 与实时音频
+
+录音音量条可以直接从每个 PCM chunk 的 peak amplitude 计算，但显示必须是低优先级旁路，不能反过来拖慢采集或网络：
+
+1. 先把 PCM 放进 WebSocket sender 的 ring buffer，再计算 meter 和绘制。
+2. 不要每帧多次 `fillRect`、malloc/free 或逐条 SPI 清屏再填色；这既会闪，也会阻塞主循环。
+3. 用持久化 RGB565 buffer 在内存中合成完整 meter，一次 `draw_bitmap`/DMA 提交。
+4. 音频可按 20-40ms chunk 处理，但 LCD 限制到约 10fps；显示值与最新采样值分开保存，避免限帧时漏掉最后一次回落。
+5. peak meter 使用快速 attack、较慢 release，可读性优于未平滑的瞬时振幅。
+
+小屏 UI 的实测可读模式是：状态 banner 全宽贴边，深色背景配浅色状态文字；banner 下方正文统一保留安全 margin。状态页可以放到 BtnB，显示 Wi-Fi、BLE 和 token 是否配置；如果显示 token 摘要，只保留开头/结尾并 mask 中间，绝不显示完整 secret。
+
+### 实时 WebSocket 语音路径
+
+要做到松开录音键后快速出结果，不能在停止后才上传。推荐路径是：按下时异步建立 session/WebSocket，同时立即采集到 ring buffer；连接 ready 后由独立 sender task 持续发送 PCM；松开时只 drain 最后少量 backlog，再发 `commit`。显示音量、更新 LCD 或阻塞式 socket write 都不能放在 I2S capture 的关键路径上。
+
+排查“感觉停止后才开始上传”时，分别记录按键到 first queued、first socket send、stop 时 tail drain、commit 到 transcript completed 四段时间。否则很容易把 TLS 建连、网络 backlog 或服务端 inference 延迟误判成没有流式上传。
+
 ## 存储（NVS / Preferences）
 
 ```cpp
@@ -535,6 +566,10 @@ IRremoteESP8266 库的 `sendSAMSUNG(0xE0E040BF, 32)` 可以发送 Samsung32 码�
 | 把绿灯状态当成应用诊断 | 闪烁时误判崩溃，或从其他灯态推断应用正常 | 只把绿灯闪烁解释为 Download Mode；其他灯态不下结论 |
 | 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时连接 USB，长按 PWR/reset 直到绿灯闪烁 |
 | BLE HID 延时小于一个 FreeRTOS tick | 文字约 17 字符后截断，NimBLE 报 `Unable to fetch protocol_mode` | 检查 `CONFIG_FREERTOS_HZ`；100Hz 时 `pdMS_TO_TICKS(5)` 为 0。40 个 msys buffer 配合返回值检查和有界重试时，10ms 已通过连续 95 字符实机测试 |
+| 每个 BLE HID key 都发送 press + release | 打字速度只有必要 report 数量的一半 | 不同 key 可直接用下一份状态 report 替换，自动释放旧 key；相同连续 key 必须先发空 report，字符串结尾必须 release |
+| BGR panel 仍用标准 RGB565 packing | 红蓝互换，`BLUE` 实际不蓝，整套 palette 怪异 | 根据 panel `color_space` 统一使用 BGR565 packing，不要逐个猜 palette 值 |
+| `draw_bitmap` 返回后立刻复用或释放 buffer | 图形大致正确但颜色随机，深色 banner 变黄、浅色文字变红 | `on_color_trans_done` 发 semaphore；DMA 完成后才能改写栈/static buffer 或 `free()` heap buffer |
+| 音量条每个 audio chunk 多次清屏/填色 | meter 闪烁，按钮和录音链路变迟钝 | 音频先入队；静态 framebuffer 一次合成、一次 DMA，LCD 限制约 10fps |
 | drawHeader 不设字体 | 继承前一个屏幕的字体，显示异常 | 封装函数内显式 setFont |
 | 底部文字用大字体 | 超出 135 像素屏幕高度被裁剪 | 底部用 Font0，y 不超过 130 |
 
