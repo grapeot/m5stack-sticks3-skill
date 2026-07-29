@@ -14,6 +14,12 @@
 
 M5StickS3 是 M5Stack Stick 系列的最新产品，但它和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。社区固件（Bruce、NEMO）对 StickS3 的支持不成熟，有多个已知 bug。本技能记录在 StickS3 上从零开发固件所需的全部硬约束和踩坑经验，让后续 agent 不需要重复试错。
 
+### 首要调试原则：查 board-support 源码，不猜
+
+遇到引脚、panel flag、PMIC rail、按钮或 codec 初始化问题时，先查当前版本的 M5GFX/M5Unified 中 `board_M5StickS3` 分支，再参考通用 ST7789/ESP32 示例。M5Stack 的 board-support 源码直接编码了量产板所需的精确参数，优先级高于相近型号经验、社区帖子和肉眼试色。
+
+例如 M5GFX 的 StickS3 分支明确给出：`Panel_ST7789`、135x240、offset `(52,40)`、`invert=true`、默认 RGB element order、40MHz write clock、CS=41、RST=21、MOSI=39、SCLK=40、DC=45。若一开始逐项照抄这些事实，就不需要在 RGB/BGR 和 inversion 之间反复猜测。只有源码与实机仍不一致时，才做最小化纯色/引脚实验，并把差异记录下来。
+
 ## 硬件概览
 
 ### 芯片与外设
@@ -409,18 +415,22 @@ M5.Display.printf("Hello");
 - `drawHeader()` 之类的封装函数要**自己设置字体**，否则会继承上一个屏幕的字体
 - 底部文字不要超过 y=130（135 像素高），用 `Font0` 而非 `FreeMonoBold9pt7b` 放底部提示
 
-### ESP-IDF 的 BGR565 颜色
+### ESP-IDF 的 RGB565 颜色
 
-StickS3 的 ST7789P3 通常以 BGR color order 初始化。直接把标准 RGB565 宏产生的像素交给这种 panel 配置时，红蓝通道会互换；最明显的诊断是代码中的蓝色实际显示成红色。裸 `esp_lcd` framebuffer 应按 BGR565 打包：
+StickS3 官方 M5GFX board 配置使用默认 RGB element order，裸 `esp_lcd` pixel buffer 使用标准 RGB565。不要额外选择 BGR 或手动交换 framebuffer 的红蓝字段；实测这样会让纯蓝显示成红褐色。使用标准 packing，并把 panel inversion 当作另一项独立设置：
 
 ```c
-#define BGR565(r, g, b) \
-  (((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3))
+#define RGB565(r, g, b) \
+  (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
 ```
 
-不要靠逐个修改 palette 值来补偿，这会让颜色命名与实际效果继续错位。先确认 panel 的 `color_space`，再统一修正 pixel packing。
+颜色排错顺序应是：先用 `0x0000`/`0xFFFF` 判断 inversion，再用纯红/纯蓝判断 element order，最后才调 palette。不要同时改 inversion、RGB/BGR 和配色，否则每次肉眼结果都无法归因。
+
+ESP32 内存中的 `uint16_t` 是 little-endian，还必须设置 `.data_endian = LCD_RGB_DATA_ENDIAN_LITTLE`。否则 ST7789 driver 默认把 RAMCTRL 配为 big-endian：深蓝 `0x0009` 的内存字节 `09 00` 会被当成 `0x0900`（草绿），蓝色 `0x00DF` 会变成 `0xDF00`（黄）。这类“蓝变黄、深蓝变绿”是 byte endian 的强特征，不是 RGB/BGR order。
 
 `esp_lcd_panel_draw_bitmap()` 通过 SPI panel IO 提交的 color transfer 是异步的。传入栈数组后立即复用，或传入 heap buffer 后立即 `free()`，DMA 可能继续读取已变化的内存；画面形状往往仍然正确，但颜色会随机变成黄、红等错误值。注册 `on_color_trans_done` callback，用 binary semaphore 等待传输完成后再复用 framebuffer。ESP-IDF 头文件也明确要求在该 callback 后 recycle color buffer。
+
+StickS3 的 IPS ST7789P3 还需要 `esp_lcd_panel_invert_color(panel, true)`。如果 `0xFFFF` 白色显示为黑色、深色显示为浅色，这不可能由 RGB/BGR channel order 引起，而是遗漏了 panel INVON。应先修 inversion，再判断 palette、BGR 和 byte endian；否则会在完全错误的极性上反复猜颜色。
 
 ### 动态 UI 与实时音频
 
@@ -567,8 +577,11 @@ IRremoteESP8266 库的 `sendSAMSUNG(0xE0E040BF, 32)` 可以发送 Samsung32 码�
 | 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时连接 USB，长按 PWR/reset 直到绿灯闪烁 |
 | BLE HID 延时小于一个 FreeRTOS tick | 文字约 17 字符后截断，NimBLE 报 `Unable to fetch protocol_mode` | 检查 `CONFIG_FREERTOS_HZ`；100Hz 时 `pdMS_TO_TICKS(5)` 为 0。40 个 msys buffer 配合返回值检查和有界重试时，10ms 已通过连续 95 字符实机测试 |
 | 每个 BLE HID key 都发送 press + release | 打字速度只有必要 report 数量的一半 | 不同 key 可直接用下一份状态 report 替换，自动释放旧 key；相同连续 key 必须先发空 report，字符串结尾必须 release |
-| BGR panel 仍用标准 RGB565 packing | 红蓝互换，`BLUE` 实际不蓝，整套 palette 怪异 | 根据 panel `color_space` 统一使用 BGR565 packing，不要逐个猜 palette 值 |
+| 看到 BGR 配置后又手动交换 RGB565 红蓝位 | 纯蓝显示红褐色或紫色，palette 无法直觉调整 | StickS3 实机 framebuffer 使用标准 RGB565；先用纯色块单独验证 element order |
+| 凭相近 ST7789 板型猜 panel 参数 | offset 对了但 inversion/order 错，反复调色仍不稳定 | 直接查 M5GFX `board_M5StickS3`：RGB order、`invert=true`、offset `(52,40)` |
+| RGB565 framebuffer 未声明 little endian | 深蓝 `0x0009` 显示草绿，蓝色 `0x00DF` 显示黄色 | `esp_lcd_panel_dev_config_t.data_endian = LCD_RGB_DATA_ENDIAN_LITTLE` |
 | `draw_bitmap` 返回后立刻复用或释放 buffer | 图形大致正确但颜色随机，深色 banner 变黄、浅色文字变红 | `on_color_trans_done` 发 semaphore；DMA 完成后才能改写栈/static buffer 或 `free()` heap buffer |
+| StickS3 ST7789P3 未开启 color inversion | 白色显示黑色、深色显示浅色，怎么调 palette 都不对 | panel init 后调用 `esp_lcd_panel_invert_color(panel, true)`，再检查 BGR/endian |
 | 音量条每个 audio chunk 多次清屏/填色 | meter 闪烁，按钮和录音链路变迟钝 | 音频先入队；静态 framebuffer 一次合成、一次 DMA，LCD 限制约 10fps |
 | drawHeader 不设字体 | 继承前一个屏幕的字体，显示异常 | 封装函数内显式 setFont |
 | 底部文字用大字体 | 超出 135 像素屏幕高度被裁剪 | 底部用 Font0，y 不超过 130 |
