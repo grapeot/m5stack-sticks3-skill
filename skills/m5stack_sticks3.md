@@ -5,9 +5,10 @@
 ## 元数据
 
 - **类型**: BestPractice / API Guide
-- **适用场景**: 在 M5StickS3 上开发 Arduino 固件，尤其是 IR 红外、按钮交互、RMT 外设、NVS 存储
+- **适用场景**: 在 M5StickS3 上开发 Arduino 或 ESP-IDF 固件，尤其是 IR、按钮、电源、ES8311 音频、RMT 和 NVS
 - **硬件**: M5StickS3 (ESP32-S3-PICO-1-N8R8, 8MB Flash, 8MB PSRAM)
 - **创建日期**: 2026-07-29
+- **最后验证**: 2026-07-29（ESP-IDF 5.5.5、`esp_codec_dev` 1.6.2）
 
 ## 这个技能解决什么问题
 
@@ -40,7 +41,7 @@ M5StickS3 是 M5Stack Stick 系列的最新产品，但它和前代 StickC/Plus/
 | BtnA | 11 | 正面 M5 主按键，wasPressed/wasHold/wasDoubleClicked |
 | BtnB | 12 | 侧键 |
 | PWR | M5PM1 | 电源键，硬件级，短按重启 |
-| BOOT | 0 | ROM strap；由板级下载控制使用，不当作普通空闲 GPIO |
+| GPIO0 | 0 | ROM strap；没有独立物理 BOOT 键，不当作普通空闲 GPIO |
 | LCD MOSI | 39 | |
 | LCD SCK | 40 | |
 | LCD RS | 45 | |
@@ -49,6 +50,11 @@ M5StickS3 是 M5Stack Stick 系列的最新产品，但它和前代 StickC/Plus/
 | LCD BL | 38 | 背光 PWM |
 | I2C SCL | 48 | BMI270 + M5PM1 共用 |
 | I2C SDA | 47 | |
+| ES8311 MCLK | 18 | MCU → codec |
+| ES8311 BCLK | 17 | MCU → codec |
+| ES8311 LRCK | 15 | MCU → codec |
+| I2S RX / ES8311 ASDOUT | 16 | codec → MCU，麦克风数据 |
+| I2S TX / ES8311 DSDIN | 14 | MCU → codec，扬声器数据 |
 
 ## 开发环境搭建
 
@@ -136,7 +142,7 @@ macOS 上设备通常显示为 `/dev/cu.usbmodem*` 和 `/dev/tty.usbmodem*`；�
 |------|-------------|----------|-------------|-----|
 | BtnA | GPIO 11 | 正面 | ✅ 完全控制 | `M5.BtnA.wasPressed()` |
 | BtnB | GPIO 12 | 侧面 | ✅ 完全控制 | `M5.BtnB.wasPressed()` |
-| PWR | M5PM1 PMIC (I2C) | 侧面 | ⚠️ 有限 | 见下文 |
+| PWR/reset | M5PM1 PMIC | 侧面 | ❌ 不用于 UI | 短按复位、双击关机、长按进入下载模式 |
 
 ### BtnA / BtnB 的完整事件 API
 
@@ -156,13 +162,9 @@ M5.BtnA.isPressed()           // 当前是否按下
 
 BtnB 的 API 完全相同，把 `BtnA` 换成 `BtnB`。
 
-### PWR 电源键——硬件级，不可拦截
+### PWR/reset 电源键——硬件级，不用于 UI
 
-**这是最重要的踩坑。** PWR 键不是 GPIO，是 M5PM1 PMIC 通过 I2C 上报的电源事件。在 M5Unified 中：
-
-- `M5.BtnPWR.wasClicked()` 和 `M5.BtnPWR.wasHold()` **在某些版本下可能工作**，但
-- **短按 PWR 会触发硬件复位**，固件无法拦截。这不是固件 bug，是 M5PM1 的硬件行为。
-- 双击 PWR = 硬件关机。
+PWR/reset 不是普通 GPIO。短按会触发硬件复位，双击会关机，USB 已连接时长按可进入下载模式。固件不能把这些默认硬件动作当成可靠的应用输入。
 
 **结论：不要用 PWR 键做 UI 操作。** 只用 BtnA 和 BtnB。如果需要选择/确认/返回，用短按和双击/长按组合。这个 skill 的默认安全边界是：不改写 M5PM1 对 PWR 的复位、关机和下载模式默认动作；它是设备从固件卡死中恢复的最后路径。
 
@@ -344,10 +346,6 @@ StickS3 内置 IR 接收器对环境红外敏感。不校验的固件（如 Bruc
 
 ## 电源与启动
 
-### 电池
-
-StickS3 内置 250mAh 电池。**拔 USB 不会断电**（电池供电），所以拔插 USB 不会强制重启设备。
-
 ### 进入 Download Mode（刷固件模式）
 
 StickS3 没有独立 BOOT 键。进入下载模式的官方流程：
@@ -364,34 +362,35 @@ StickS3 没有独立 BOOT 键。进入下载模式的官方流程：
 esptool 刷完后会自动发 hard reset，设备应从 flash 启动。如果因电池供电导致 reset 无效：
 - 短按一下 PWR/reset 键（单击 = 硬件复位，会从 flash 正常启动）
 - 如果短按也没用，双击 PWR 关机，再单击开机
-- **不要按住 PWR 插 USB**——长按 PWR 是进入下载模式的触发条件，不是退出
-
-### PWR 键行为
-
-- 短按 PWR = 硬件复位（重启），固件无法拦截
-- 双击 PWR = 硬件关机
-- 长按 PWR（USB 已连接时）= 进入下载模式
-- **固件不应依赖 PWR 键做任何 UI 功能**
 
 ### 电池与电源保持
 
 StickS3 内置 250mAh 电池。**拔插 USB 不会强制重启设备**（电池持续供电）。
 
-StickS3 不需要传统 GPIO HOLD pin 来维持电源。M5PM1 自身管理电源保持——M5Unified 源码确认 StickS3 不在 `power_hold` pin 表里。USB 供电时直接运行；电池供电时 M5PM1 在开机后维持供电，不需要固件额外操作。如果需要软件关机，通过 M5PM1 I2C 命令实现，而不是拉低某个 GPIO。
+StickS3 不需要 MCU GPIO4 HOLD 来维持主电源。M5PM1 自身管理主电源保持，M5Unified 的 `power_hold` pin 表也不包含 StickS3。这里不要与音频轨的 M5PM1 `LDO_HOLD` 位混淆：后者仍需在纯 ESP-IDF 音频初始化中设置。如果需要软件关机，通过 M5PM1 I2C 命令实现，而不是拉低 GPIO4。
 
-### M5PM1 EXT_5V（BOOST 5V）与 ES8311 codec
+### ES8311 与麦克风供电
 
-**ES8311 音频 codec 的供电可能依赖 M5PM1 的 EXT_5V（BOOST 5V）输出。** M5Unified 默认初始化会关闭 EXT_5V，这会切断 Grove、Hat EXT_5V 以及内置 IR TX/RX 的供电。在不使用 M5Unified 的纯 ESP-IDF 固件中，如果不主动通过 M5PM1 开启 BOOST，ES8311 可能无法正常工作（I2C 通信失败、无音频数据）。
+ES8311 和 MEMS mic 由 `3V3_L3B_AU` 供电，不依赖 EXT_5V / BOOST 5V。纯 ESP-IDF 固件需要通过 M5PM1（I2C `0x6e`）打开 LDO，并把 GPIO2 `PYG2_L3B_EN` 配为推挽输出高电平：
 
-M5PM1 的 EXT_5V 控制方式：I2C 地址 0x6e，寄存器 0x06（PWR_CFG），bit 3 = BOOST_EN。写 `0x06` 寄存器，置 bit 3 = 1 即可开启 BOOST 5V 输出。<tool_call>
-
-### 外部供电
-
-```cpp
-M5.Power.setExtOutput(true, m5::ext_none);  // 开启 5V 外部供电
+```c
+pmic_update(0x06, BIT(4), BIT(2)); // LDO_EN=1；可同时关闭 LED_CTRL
+pmic_update(0x07, 0, BIT(5));      // LDO_HOLD=1
+pmic_update(0x16, BIT(2), 0);      // GPIO2 function=GPIO
+pmic_update(0x10, 0, BIT(2));      // GPIO2 direction=output
+pmic_update(0x13, BIT(2), 0);      // GPIO2 push-pull
+pmic_update(0x11, 0, BIT(2));      // GPIO2 high，L3B on
 ```
 
-IR 模块和 Grove 外设可能需要外部供电。
+ES8311 初始化优先使用 Espressif `esp_codec_dev`。实机验证配置为：`esp_codec_dev` 1.6.2、ESP32 `I2S_ROLE_MASTER`、codec `master_mode=false`、`use_mclk=true`、256×FS MCLK、ADC mode、16-bit mono left slot、24kHz 和 36dB input gain。通过 `esp_codec_dev_open()` 完成状态转换，并用 `esp_codec_dev_read()` 读取 PCM。只手抄部分寄存器即使身份 readback 正常，也可能得到严格全零 PCM。
+
+### EXT_5V 输出
+
+```cpp
+M5.Power.setExtOutput(true, m5::ext_none);  // 开启 BOOST/EXT_5V 输出轨
+```
+
+该轨用于 Grove、Hat 和 IR，不给 ES8311 或 MEMS mic 供电。
 
 ## 显示
 
@@ -452,7 +451,7 @@ Bruce (v1.16) 支持 StickS3 但有多个 bug：
 
 1. **黑屏/背光初始化 bug**（GitHub issue #2371）：board 初始化代码覆盖了背光 PWM 值导致屏幕全黑，绿灯闪烁。v1.16 的 prebuilt binary 可能未包含修复。
 2. **IR Read 抓到噪声**：不校验 NEC 帧，把所有 RMT 接收到的信号都显示出来，包括环境噪声。每次值不同。
-3. **按钮映射问题**（GitHub issue #2148）：顶部按钮行为异常，按下后屏幕关闭 3 秒而非导航。
+3. **按钮映射问题**（GitHub issue #2148）：外部 issue 报告按钮行为异常；其物理键命名与本 skill 的 BtnA/BtnB/PWR 口径不一致，引用时不要据此改写已验证映射。
 4. **RAM 报错**：麦克风录音报 "Not enough RAM"，尽管 StickS3 有 8MB PSRAM。
 
 **结论：Bruce 在 StickS3 上不适合做严肃的 IR 工具。自己写固件更可控。**
@@ -500,12 +499,12 @@ IRremoteESP8266 库的 `sendSAMSUNG(0xE0E040BF, 32)` 可以发送 Samsung32 码�
 | NEC 解码用单一阈值 `space > 1000` | 噪声和异常 space 被接受 | 用窗口：0 = 300-1000us, 1 = 1200-2200us |
 | NVS 多次 putULong/putUChar | 断电时可能只写入部分字段 | 用 putBytes 存单个 blob |
 | 拔 USB 后设备不重启 | 电池供电，拔 USB 不断电 | 双击 PWR 关机后单击开机，或短按 PWR 复位 |
-| 纯 ESP-IDF 固件不初始化 M5PM1 | ES8311 codec I2C 通信失败、无音频；IR 不工作 | 通过 I2C 写 M5PM1 寄存器 0x06 bit 3 开启 BOOST 5V |
-| 误以为需要 GPIO4 HOLD | 不必要地占用 GPIO4，可能影响其他功能 | StickS3 不需要 HOLD pin；M5PM1 自管电源保持 |
+| 把 ES8311 供电误认成 BOOST 5V | ES8311 身份寄存器读取失败或 codec 未上电 | 打开 M5PM1 LDO_EN/LDO_HOLD，并将 GPIO2 `PYG2_L3B_EN` 输出高电平 |
+| 手抄部分 ES8311 寄存器 | 身份 readback 正常但 PCM 严格全零 | 使用 `esp_codec_dev_open()` + `esp_codec_dev_set_in_gain()` 完成 open/enable/gain 状态机 |
+| 误以为需要 GPIO4 HOLD | 不必要地占用 GPIO4，或误删音频 `LDO_HOLD` | 主电源不需要 GPIO4 HOLD；音频 L3B 仍需 M5PM1 `LDO_HOLD` |
 | 进入下载模式用按 BOOT 插 USB | StickS3 没有 BOOT 键，操作无效 | 连 USB 后长按侧边 PWR/reset 直到绿灯闪 |
-| 绿灯闪烁后误判为固件崩溃 | 绿灯闪烁是下载模式正常信号 | 闪烁=下载模式；其他灯态不下结论 |
-| 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或当前动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时按 BOOT 进 download mode 再操作 |
-| 将绿灯其他状态当作诊断结论 | 把 PMIC 状态误判为应用正常、充电或崩溃 | 只有“绿灯闪烁 = 已进入 Download Mode”有官方定义；其他灯态不下结论 |
+| 把绿灯状态当成应用诊断 | 闪烁时误判崩溃，或从其他灯态推断应用正常 | 只把绿灯闪烁解释为 Download Mode；其他灯态不下结论 |
+| 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时连接 USB，长按 PWR/reset 直到绿灯闪烁 |
 | drawHeader 不设字体 | 继承前一个屏幕的字体，显示异常 | 封装函数内显式 setFont |
 | 底部文字用大字体 | 超出 135 像素屏幕高度被裁剪 | 底部用 Font0，y 不超过 130 |
 
