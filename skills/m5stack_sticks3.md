@@ -350,28 +350,40 @@ StickS3 内置 250mAh 电池。**拔 USB 不会断电**（电池供电），所�
 
 ### 进入 Download Mode（刷固件模式）
 
-1. 拔掉 USB
-2. **按住 BOOT 键不松手**
-3. 插上 USB
-4. 松开 BOOT 键
+StickS3 没有独立 BOOT 键。进入下载模式的官方流程：
 
-设备停在 ROM bootloader，屏幕无显示。**内部绿灯闪烁是 M5 官方明确的 Download Mode
-成功信号**。此时 esptool / arduino-cli 可以稳定连接。不要把绿灯常亮、熄灭或其他
-节奏解释成应用已正常运行、充电或崩溃：官方没有给出这类状态表。
+1. 连接 USB 线
+2. **按住侧边 PWR/reset 键不放**
+3. 内部绿色 LED 开始闪烁 = 已进入下载模式
+4. 松开 PWR/reset 键
+
+此时 esptool / arduino-cli 可以稳定连接。
 
 ### 从 Download Mode 正常启动
 
-esptool 刷完后的 `hard reset` 在 BOOT 接地时可能无效。解决方法：
-- **拔掉 USB，不按任何键，重新插上**
-- 如果因为电池供电导致拔插无效，**快速按一下 PWR 键**（短按开机）
-- 或者按住 BOOT 插 USB 后立刻松开 BOOT（不保持），设备会尝试从 flash 启动
+esptool 刷完后会自动发 hard reset，设备应从 flash 启动。如果因电池供电导致 reset 无效：
+- 短按一下 PWR/reset 键（单击 = 硬件复位，会从 flash 正常启动）
+- 如果短按也没用，双击 PWR 关机，再单击开机
+- **不要按住 PWR 插 USB**——长按 PWR 是进入下载模式的触发条件，不是退出
 
 ### PWR 键行为
 
 - 短按 PWR = 硬件复位（重启），固件无法拦截
 - 双击 PWR = 硬件关机
-- 长按 PWR = 进入 boot mode（部分固件版本）
+- 长按 PWR（USB 已连接时）= 进入下载模式
 - **固件不应依赖 PWR 键做任何 UI 功能**
+
+### 电池与电源保持
+
+StickS3 内置 250mAh 电池。**拔插 USB 不会强制重启设备**（电池持续供电）。
+
+StickS3 不需要传统 GPIO HOLD pin 来维持电源。M5PM1 自身管理电源保持——M5Unified 源码确认 StickS3 不在 `power_hold` pin 表里。USB 供电时直接运行；电池供电时 M5PM1 在开机后维持供电，不需要固件额外操作。如果需要软件关机，通过 M5PM1 I2C 命令实现，而不是拉低某个 GPIO。
+
+### M5PM1 EXT_5V（BOOST 5V）与 ES8311 codec
+
+**ES8311 音频 codec 的供电可能依赖 M5PM1 的 EXT_5V（BOOST 5V）输出。** M5Unified 默认初始化会关闭 EXT_5V，这会切断 Grove、Hat EXT_5V 以及内置 IR TX/RX 的供电。在不使用 M5Unified 的纯 ESP-IDF 固件中，如果不主动通过 M5PM1 开启 BOOST，ES8311 可能无法正常工作（I2C 通信失败、无音频数据）。
+
+M5PM1 的 EXT_5V 控制方式：I2C 地址 0x6e，寄存器 0x06（PWR_CFG），bit 3 = BOOST_EN。写 `0x06` 寄存器，置 bit 3 = 1 即可开启 BOOST 5V 输出。<tool_call>
 
 ### 外部供电
 
@@ -479,7 +491,11 @@ Bruce (v1.16) 支持 StickS3 但有多个 bug：
 | RMT RX callback 返回值一律写死 | 误报调度状态或漏掉唤醒 | 只写 volatile 标志时返回 false；用 FromISR API 唤醒高优先级 task 时返回 wake 标志 |
 | NEC 解码用单一阈值 `space > 1000` | 噪声和异常 space 被接受 | 用窗口：0 = 300-1000us, 1 = 1200-2200us |
 | NVS 多次 putULong/putUChar | 断电时可能只写入部分字段 | 用 putBytes 存单个 blob |
-| 拔 USB 后设备不重启 | 电池供电，拔 USB 不断电 | 快速按一下 PWR 键，或拔 USB 后等几秒再插 |
+| 拔 USB 后设备不重启 | 电池供电，拔 USB 不断电 | 双击 PWR 关机后单击开机，或短按 PWR 复位 |
+| 纯 ESP-IDF 固件不初始化 M5PM1 | ES8311 codec I2C 通信失败、无音频；IR 不工作 | 通过 I2C 写 M5PM1 寄存器 0x06 bit 3 开启 BOOST 5V |
+| 误以为需要 GPIO4 HOLD | 不必要地占用 GPIO4，可能影响其他功能 | StickS3 不需要 HOLD pin；M5PM1 自管电源保持 |
+| 进入下载模式用按 BOOT 插 USB | StickS3 没有 BOOT 键，操作无效 | 连 USB 后长按侧边 PWR/reset 直到绿灯闪 |
+| 绿灯闪烁后误判为固件崩溃 | 绿灯闪烁是下载模式正常信号 | 闪烁=下载模式；其他灯态不下结论 |
 | 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或当前动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时按 BOOT 进 download mode 再操作 |
 | 将绿灯其他状态当作诊断结论 | 把 PMIC 状态误判为应用正常、充电或崩溃 | 只有“绿灯闪烁 = 已进入 Download Mode”有官方定义；其他灯态不下结论 |
 | drawHeader 不设字体 | 继承前一个屏幕的字体，显示异常 | 封装函数内显式 setFont |
