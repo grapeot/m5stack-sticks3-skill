@@ -472,7 +472,36 @@ Bruce (v1.16) 支持 StickS3 但有多个 bug：
 
 即使蓝牙配对后，**电源键和音量键通常始终走 IR**。如果只想测试 IR Copier 能不能抓到码，先按电源键或音量键。其他智能功能键（Home、方向键等）可能只走蓝牙。
 
-### 协议
+## 三星电视控制：红外 vs SmartThings API
+
+### 红外方案（不适用于高端三星电视）
+
+三星 Neo QLED 8K 等高端电视配的 SolarCell 遥控器（VG-TM2360E）日常**通过蓝牙控制电视**，红外只是 fallback。红外方案在以下环节全部失败：
+
+1. **Copy 失败**：SolarCell 遥控器的私有短协议（13 symbol / 21.5ms，76us mark）无法被 StickS3 IR 接收器正确解调
+2. **预设码回放失败**：IRremoteESP8266 `sendSAMSUNG()` 发送标准 Samsung32 码，电视无反应（电视不接受红外电源命令）
+
+### SmartThings API 方案（推荐）
+
+StickS3 通过 WiFi + SmartThings API 控制 Samsung 电视，完全绕过红外：
+
+1. **配置**：
+   - 电视添加到 SmartThings app
+   - 电视设置开启 "Power On with Mobile"（Settings → All Settings → Connections → Network → Expert Settings）
+   - 生成 SmartThings Personal Access Token（https://account.smartthings.com/tokens，需 `r:devices:*`、`w:devices:*`、`x:devices:*`）
+   - 查询 device ID：`curl -H "Authorization: Bearer TOKEN" https://api.smartthings.com/v1/devices`
+
+2. **API 调用**：
+   - 开关：`POST https://api.smartthings.com/v1/devices/{deviceId}/commands`，body `{"commands":[{"component":"main","capability":"switch","command":"on"}]}`
+   - 查状态：`GET https://api.smartthings.com/v1/devices/{deviceId}/components/main/status`
+   - 音量：capability=`audioVolume`，command=`volumeUp`/`volumeDown`
+   - 静音：capability=`audioMute`，command=`mute`
+
+3. **ESP32 实现**：`WiFiClientSecure` + `setInsecure()` 跳过证书验证，`HTTPClient` 发 POST
+
+4. **已知限制**：PAT 24 小时过期（2024-12-30 后创建的），长期方案需 OAuth2 app
+
+### 红外协议详情（供其他电视参考）
 
 三星遥控器使用 **Samsung32** 协议，时序与标准 NEC 类似但 header 不同。Samsung32 发送 address byte 两次（不是 address + inverse），然后 command + inverse。标准 Samsung power toggle = `0xE0E040BF`（address=0x07, command=0x02）。
 
@@ -505,7 +534,7 @@ IRremoteESP8266 库的 `sendSAMSUNG(0xE0E040BF, 32)` 可以发送 Samsung32 码�
 | 进入下载模式用按 BOOT 插 USB | StickS3 没有 BOOT 键，操作无效 | 连 USB 后长按侧边 PWR/reset 直到绿灯闪 |
 | 把绿灯状态当成应用诊断 | 闪烁时误判崩溃，或从其他灯态推断应用正常 | 只把绿灯闪烁解释为 Download Mode；其他灯态不下结论 |
 | 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时连接 USB，长按 PWR/reset 直到绿灯闪烁 |
-| BLE HID 延时小于一个 FreeRTOS tick | 文字约 17 字符后截断，NimBLE 报 `Unable to fetch protocol_mode` | 检查 `CONFIG_FREERTOS_HZ`；100Hz 时 `pdMS_TO_TICKS(5)` 为 0，报告间隔至少用 10ms，建议 20ms，并检查发送返回值和有界重试 |
+| BLE HID 延时小于一个 FreeRTOS tick | 文字约 17 字符后截断，NimBLE 报 `Unable to fetch protocol_mode` | 检查 `CONFIG_FREERTOS_HZ`；100Hz 时 `pdMS_TO_TICKS(5)` 为 0。40 个 msys buffer 配合返回值检查和有界重试时，10ms 已通过连续 95 字符实机测试 |
 | drawHeader 不设字体 | 继承前一个屏幕的字体，显示异常 | 封装函数内显式 setFont |
 | 底部文字用大字体 | 超出 135 像素屏幕高度被裁剪 | 底部用 Font0，y 不超过 130 |
 
