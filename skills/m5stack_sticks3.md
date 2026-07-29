@@ -475,7 +475,15 @@ Bruce (v1.16) 支持 StickS3 但有多个 bug：
 
 ### 协议
 
-三星遥控器使用 **Samsung32** 协议，时序与标准 NEC 完全相同（9ms mark + 4.5ms space + 32 bit + 560us stop），地址+地址反码+命令+命令反码。标准 NEC 解码器可以直接解码。
+三星遥控器使用 **Samsung32** 协议，时序与标准 NEC 类似但 header 不同。Samsung32 发送 address byte 两次（不是 address + inverse），然后 command + inverse。标准 Samsung power toggle = `0xE0E040BF`（address=0x07, command=0x02）。
+
+IRremoteESP8266 库的 `sendSAMSUNG(0xE0E040BF, 32)` 可以发送 Samsung32 码。注意 API 是全大写 `sendSAMSUNG`，不是 `sendSamsung`。
+
+### 重要：高端三星电视走蓝牙不走红外
+
+三星 Neo QLED 8K 等高端电视配的 SolarCell 遥控器（VG-TM2360E）日常**通过蓝牙控制电视**，红外只是 fallback。判断方法：在楼下按遥控器，楼上电视有反应 = 蓝牙控制。这种情况下直接发送 IR 码电视不会有反应。
+
+此外 SolarCell 遥控器的私有短协议（13 symbol / 21.5ms 帧，76us mark）无法被 StickS3 的 IR 接收器正确解调——76us 的 mark 太短，标准 IR 接收器需要至少 ~200us 连续载波才能识别。这意味着**无法可靠 copy 这个遥控器的信号**，只能用预设码发送。
 
 ## 已知陷阱汇总
 
