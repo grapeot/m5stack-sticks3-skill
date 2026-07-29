@@ -427,6 +427,26 @@ Bruce (v1.16) 支持 StickS3 但有多个 bug：
 
 **结论：Bruce 在 StickS3 上不适合做严肃的 IR 工具。自己写固件更可控。**
 
+## 三星 SolarCell Smart Remote 的 IR 问题
+
+三星高端 TV（Neo QLED 8K 等）配的 SolarCell Smart Remote（如 VG-TM2360E / TM2360E）默认走 **Bluetooth/RF**，不是红外。这类遥控器有 IR 发射能力但出厂可能不开 IR 模式，导致 IR Copier 抓不到任何信号。
+
+### 诊断方法
+
+用手机摄像头（数码摄像头能看到红外光）对着遥控器顶部发射窗，按任意键。如果画面里有紫色/白色闪烁 = 红外在发；完全没反应 = Bluetooth-only 模式。
+
+### 激活 IR 模式
+
+同时按住遥控器上的 **Return + Play/Pause** 约 10 秒，遥控器重启并清除蓝牙配对。重新配对后 IR 功能恢复。
+
+### 快速验证
+
+即使蓝牙配对后，**电源键和音量键通常始终走 IR**。如果只想测试 IR Copier 能不能抓到码，先按电源键或音量键。其他智能功能键（Home、方向键等）可能只走蓝牙。
+
+### 协议
+
+三星遥控器使用 **Samsung32** 协议，时序与标准 NEC 完全相同（9ms mark + 4.5ms space + 32 bit + 560us stop），地址+地址反码+命令+命令反码。标准 NEC 解码器可以直接解码。
+
 ## 已知陷阱汇总
 
 | 陷阱 | 表现 | 应对 |
