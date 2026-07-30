@@ -91,3 +91,9 @@ pmic_update(0x11, 0, BIT(2));      // GPIO2 high，L3B on
 ### 实时 WebSocket 语音路径
 
 按下时异步建立 session/WebSocket，同时立即采集到 ring buffer；连接 ready 后由独立 sender task 持续发送 PCM；松开时只 drain 最后少量 backlog，再发 `commit`。显示音量、更新 LCD 或阻塞式 socket write 都不能放在 I2S capture 的关键路径上。
+
+排查“感觉停止后才开始上传”时，分别记录按键到 first queued、first socket send、stop 时 tail drain、commit 到 transcript completed 四段时间。只有这四个时间点能区分连接建立、发送 backlog 和服务端推理延迟。
+
+### Token 与状态 UI
+
+未认证状态接口、LCD、日志和配置页不得返回完整或截断 token；只显示 `configured` / `not configured`。配置输入框保持空白，只把非空新值解释为替换操作。

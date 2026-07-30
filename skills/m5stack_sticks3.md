@@ -141,8 +141,6 @@ IR 收发细节（RMT 初始化、NEC 协议、解码校验）见 `m5stack_stick
 - 用 RMT 外设（不是 GPIO 轮询）
 - 38kHz 载波
 
-### Samsung 电视红外不适用
-
 ## 电源与启动
 
 ### 进入 Download Mode（刷固件模式）

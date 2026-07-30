@@ -225,14 +225,16 @@ bool rx_callback(rmt_channel_handle_t chan, const rmt_rx_done_event_data_t *edat
 Preferences prefs;
 prefs.begin("my_namespace", false);
 
-// 用单个 blob 存结构体（原子写入）
-struct MyData { uint8_t version; uint32_t code; };
-MyData data = {1, 0x12345678};
+// 单 key blob，显式版本和固定宽度字段便于迁移
+struct MyData { uint8_t version; uint8_t reserved[3]; uint32_t code; };
+MyData data = {1, {0, 0, 0}, 0x12345678};
 prefs.putBytes("slot0", &data, sizeof(MyData));
 
 MyData out = {};
-prefs.getBytes("slot0", &out, sizeof(MyData));
+size_t read = prefs.getBytes("slot0", &out, sizeof(MyData));
+if (read != sizeof(MyData) || out.version != 1) { /* reject or migrate */ }
 ```
 
 - key 名最长 15 字符
-- 用 blob 而非多个 putULong，避免断电时部分写入
+- 单 key blob 可降低多个相关 key 分别更新时出现部分新值、部分旧值的风险
+- 不要依赖隐式 C++ struct layout；使用固定宽度字段、显式 padding/version，并校验读取长度
