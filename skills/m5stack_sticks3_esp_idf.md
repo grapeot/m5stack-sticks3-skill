@@ -12,6 +12,24 @@
 - PSRAM：8MB **Octal/OPI**，不能配成 Quad/QSPI
 - 没有 M5Stack 专用 FQBN，使用通用 `esp32-s3-devkitc-1` 配置
 
+## 自主构建、刷写与验收
+
+原生 USB Serial/JTAG 的正常开发路径不是“每次手工进 download mode”，而是从运行态直接让 `idf.py` 自动复位、刷写和重启：
+
+```bash
+. "$IDF_PATH/export.sh"
+idf.py build
+idf.py -p /dev/cu.usbmodemXXX -b 115200 flash
+```
+
+在 M5StickS3 SKU K150 + ESP-IDF 5.5.5 上，运行态到运行态的全自动循环已经实机验证。115200 baud 是已验证的可靠刷写速率；更高 baud 即使写入看似完成，也可能在 MD5/hash 校验阶段失败。
+
+Agent 应把“自主迭代能力”本身当作 bring-up 验收项：第一次人工恢复到可运行状态后，再执行一次无按键 flash，并通过网络 health/status 或等价机器可读信号确认新固件恢复运行。后续调试、最小复现和二分实验都从这个已知可工作的闭环开始逐项加回变量。
+
+能力边界：应用若重配 GPIO19/GPIO20、关闭 USB Serial/JTAG、进入 deep sleep，或 light sleep 使 USB controller/PHY 不可响应，主机端口可能消失，此时无法从主机发起自动 download。先尝试网络控制面恢复；两条控制面都不可用时，才请求用户长按 PWR/reset 至绿灯闪烁做一次恢复刷写。不要把“已停在手工触发的 ROM download mode 后 hard reset 行为异常”和“正常运行态不能自动刷写”混为一谈。
+
+不要用 `esptool run` 默认行为替代标准 flash-to-run 验收：该命令执行用户代码后仍可能按默认 `--after=hard_reset` 再次复位，观察到的最终状态容易误导。也不要在验证自动重启时立刻重新打开 serial monitor；USB CDC 的控制线变化可能增加一次 `USB_UART_CHIP_RESET`。先从独立控制面确认应用，再按需采集串口。
+
 ## ST7789P3 LCD 裸驱
 
 ### 面板参数（来自 M5GFX board-support 源码）
@@ -78,6 +96,28 @@ pmic_update(0x11, 0, BIT(2));      // GPIO2 high，L3B on
 - notification 会占用 mbuf，检查 `esp_hidd_dev_input_set()` 返回值
 - 延时必须至少一个 FreeRTOS tick；100Hz tick 下 5ms 会被截断为 0，10ms pacing 已通过连续 95 字符实机测试
 - 不同 key 可直接发下一份状态 report；相同连续 key 必须先发空 report，字符串结束必须 final release
+
+### NimBLE、TLS 与 internal RAM
+
+StickS3 同时运行 NimBLE HID 和 HTTPS 时，不要默认把 NimBLE host allocations 全放 internal RAM。HID 为避免 notification 截断，常会提高 msys/ACL buffer 数量；这些 buffer、NimBLE host state、TLS record buffer 和网络栈会争用有限且需要连续块的 internal heap。典型表象不是明确的 `ESP_ERR_NO_MEM`，而是 TLS connect 失败，或大 body 写到约 10-20KB 后 `esp_http_client_write()` 等满 timeout、返回 0，`esp_http_client_get_errno()` 仍为 0。这很容易误判成 MTU black hole、TCP ACK 丢失或 Wi-Fi/BLE airtime coexistence。
+
+有 8MB Octal PSRAM 的 StickS3 优先配置：
+
+```text
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+# CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL is not set
+```
+
+该配置只迁移允许放 external RAM 的 NimBLE host allocations；BLE controller 仍按芯片要求使用内部资源。不要用关闭 BLE、缩小业务 request 或断开 HID 连接作为正式 workaround。
+
+实机诊断采用逐层单变量 A/B：
+
+1. 最小 TLS 固件验证大 body、multipart、write chunk、timeout 和网络 Kconfig。
+2. 完整固件暂不初始化 BLE；若上传恢复，边界落在 BLE runtime。
+3. 初始化 NimBLE 但不 advertising；若仍失败，排除 active connection 和 radio airtime contention。
+4. 单独切换 NimBLE allocation mode；恢复 advertising 和已配对 HID 后连续上传多次。
+
+在 SKU K150、ESP-IDF 5.5.5 上，internal mode 下即使禁止 advertising、没有 BLE connection，完整应用仍无法完成同一 TLS probe；关闭 BLE 可成功。关闭 BLE controller modem sleep 无改善。仅切换为 external mode 后，在 HID 已连接状态连续三次完成 65,769-byte multipart HTTPS request 并收到 HTTP 200。因此验收不能只看 BLE 能否打字和 HTTPS 小请求能否成功，必须组合测试“BLE connected + 大于历史失败边界的 TLS upload”。
 
 ## 动态 UI 与实时音频
 

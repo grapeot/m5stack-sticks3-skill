@@ -12,7 +12,7 @@
 - **适用场景**: 在 M5StickS3 上开发 Arduino 或 ESP-IDF 固件，尤其是 IR、按钮、电源、ES8311 音频、RMT 和 NVS
 - **硬件**: M5StickS3 (ESP32-S3-PICO-1-N8R8, 8MB Flash, 8MB PSRAM)
 - **创建日期**: 2026-07-29
-- **最后验证**: 2026-07-29（M5StickS3 SKU K150、ESP-IDF 5.5.5、`esp_codec_dev` 1.6.2、M5Stack Arduino core 3.3.8）
+- **最后验证**: 2026-07-30（M5StickS3 SKU K150、ESP-IDF 5.5.5、`esp_codec_dev` 1.6.2、M5Stack Arduino core 3.3.8）
 
 ## 这个技能解决什么问题
 
@@ -32,11 +32,12 @@ M5StickS3 和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。本
 |------|----------|
 | 构建与刷机 | 从干净 build 目录为 `esp32s3`/`m5stack_sticks3` 编译成功；115200 baud 刷写完成且 image hash 校验通过 |
 | 启动 | 串口确认芯片为 ESP32-S3、8MB Flash、8MB Octal PSRAM；无 boot loop |
+| 自主迭代 | 完成一次无需物理按键的“运行态 → 自动进入下载态 → 刷写 → 自动回运行态”；刷后由网络 health/status 或等价机器信号确认新固件已运行 |
 | 按钮 | BtnA/G11、BtnB/G12 各产生一次预期事件；PWR/reset 只作为恢复路径验证 |
 | LCD | 黑、白、纯红、纯绿、纯蓝色块位置和颜色正确；重复刷新无随机变色或 DMA 生命周期问题 |
 | 音频 | 24kHz、16-bit、mono 采集 1 秒得到 48,000 bytes，PCM 非全零且峰值随环境声音变化；codec identity readback 单独不算成功 |
 | IR（若使用） | 已关闭功放、开启 EXT_5V；已知 NEC 遥控器能稳定接收并通过反码/时序校验，回放由目标设备实际响应 |
-| 网络/BLE（若使用） | 状态与日志不回显 secret；BLE HID 检查 report 返回值，并完成长于 95 字符的连续实机输入测试 |
+| 网络/BLE（若使用） | 状态与日志不回显 secret；BLE HID 检查 report 返回值，并完成长于 95 字符的连续实机输入测试；同时使用 TLS 时，在 BLE 已连接状态完成一笔大于历史失败边界的上传 |
 
 ### 首要调试原则：查 board-support 源码，不猜
 
@@ -160,6 +161,44 @@ esptool 刷完后会自动发 hard reset，设备应从 flash 启动。如果因
 - 短按一下 PWR/reset 键（单击 = 硬件复位，会从 flash 正常启动）
 - 如果短按也没用，双击 PWR 关机，再单击开机
 
+### 优先建立自主刷写闭环
+
+StickS3 的原生 USB Serial/JTAG 支持从正常运行态自动进入 ROM download mode。只要应用没有关闭或重配 USB、设备没有进入会让 USB 失效的睡眠状态、主机仍能看到 CDC 端口，就应直接执行：
+
+```bash
+idf.py -p /dev/cu.usbmodemXXX -b 115200 flash
+```
+
+实机验证的稳定闭环是：
+
+```text
+正常运行态
+  → esptool 通过 USB Serial/JTAG 自动进入 download mode
+  → 115200 baud 写入并校验 image hash
+  → --after=hard_reset
+  → 新固件正常运行
+  → 通过网络 status/health 接口确认版本或测试结果
+```
+
+这应当是 agent 的默认开发循环。**不要每次刷写前都让用户长按 PWR/reset 进入下载模式。** 物理按键是恢复手段，不是正常迭代步骤。第一次 bring-up 或固件已经破坏 USB 通路时，可以请用户做一次物理恢复；设备回到正常运行态后，应立即验证并保护上述自主闭环。
+
+刷写后的验收也要避免改变被测状态。USB CDC/monitor 的打开、关闭和 DTR/RTS 操作可能再次触发 `USB_UART_CHIP_RESET`；设备本来停在 ROM download mode 时，打开 monitor 只会再次看到 `DOWNLOAD(USB/UART0)`，不能据此证明刚才的应用从未启动。优先用网络 health/status、LED 测试模式或其他独立信号确认运行。需要串口日志时，再明确把“观察应用”和“触发 reset”分开设计。
+
+#### 何时才请求用户介入
+
+先检查端口、当前网络状态和 esptool 连接结果，再决定是否需要物理操作：
+
+| 当前状态 | Agent 行为 |
+|----------|------------|
+| 应用正常运行，USB CDC 端口存在 | 直接自动刷写；不要请求按键 |
+| 刷写成功且网络 health/status 恢复 | 自主闭环成立，继续迭代 |
+| 设备已停在物理触发的 ROM download mode，刷后仍未运行 | 请求短按一次 PWR/reset；回到运行态后重新验证自动刷写 |
+| CDC 端口消失，但设备仍在网络上 | 检查 light/deep sleep、USB pin/console 配置；优先通过网络命令恢复或重启 |
+| CDC 和网络都不可达、固件 boot loop、USB 被重配 | 明确请求长按 PWR/reset 至绿灯闪烁，只做一次恢复刷写 |
+| 电源状态不明或短按无效 | 请求双击关机再单击开机，随后恢复自主闭环 |
+
+请求用户帮助时，要说明**为什么机器已经越过自主能力边界、需要做哪个动作、预期把设备送到什么状态**。用户完成后 agent 应立即继续，不把后续机器可完成的步骤再交还给用户。
+
 ### 电池与电源保持
 
 StickS3 内置 250mAh 电池。**拔插 USB 不会强制重启设备**（电池持续供电）。
@@ -194,6 +233,8 @@ NVS 用法见 `m5stack_sticks3_m5unified.md`。
 
 BLE HID 约束（NimBLE、iOS 配对、report 节奏）见 `m5stack_sticks3_esp_idf.md`。
 
+标准 HID keyboard report 传输键位，不保证直接输入中文或任意 Unicode。iOS 对 HID Unicode Page、`\uXXXX` 键盘扩展替换方案的边界，以及推荐的 UTF-8 + Custom Keyboard 架构见 [`docs/ios_chinese_input.md`](../docs/ios_chinese_input.md)。
+
 ## 已知陷阱汇总
 
 | 陷阱 | 表现 | 应对 |
@@ -213,9 +254,12 @@ BLE HID 约束（NimBLE、iOS 配对、report 节奏）见 `m5stack_sticks3_esp_
 | 手抄部分 ES8311 寄存器 | 身份 readback 正常但 PCM 严格全零 | 使用 `esp_codec_dev_open()` + `esp_codec_dev_set_in_gain()` 完成 open/enable/gain 状态机 |
 | 误以为需要 GPIO4 HOLD | 不必要地占用 GPIO4，或误删音频 `LDO_HOLD` | 主电源不需要 GPIO4 HOLD；音频 L3B 仍需 M5PM1 `LDO_HOLD` |
 | 进入下载模式用按 BOOT 插 USB | StickS3 没有 BOOT 键，操作无效 | 连 USB 后长按侧边 PWR/reset 直到绿灯闪 |
+| 每次刷写前都要求用户长按 PWR/reset | 人为打断可自动化的开发循环，无法连续实验或二分回归 | 运行态且 CDC 端口存在时直接 `idf.py ... flash`；物理 download mode 只用于恢复 |
+| 用重新打开 serial monitor 作为刷后唯一验收 | DTR/RTS 或 USB CDC open 再次触发 reset，观察动作改变设备状态 | 刷后先用网络 health/status 或独立信号验收；串口观察与 reset 控制分开 |
 | 把绿灯状态当成应用诊断 | 闪烁时误判崩溃，或从其他灯态推断应用正常 | 只把绿灯闪烁解释为 Download Mode；其他灯态不下结论 |
 | 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时连接 USB，长按 PWR/reset 直到绿灯闪烁 |
 | BLE HID 延时小于一个 FreeRTOS tick | 文字约 17 字符后截断，NimBLE 报 `Unable to fetch protocol_mode` | 检查 `CONFIG_FREERTOS_HZ`；100Hz 时 `pdMS_TO_TICKS(5)` 为 0。40 个 msys buffer 配合返回值检查和有界重试时，10ms 已通过连续 95 字符实机测试 |
+| NimBLE host buffer 全放 internal RAM，同时运行 TLS | TLS connect 或大 body write 失败，`esp_http_client_write()` 可能返回 0 且 socket errno 仍为 0，看起来像 MTU、ACK 或 Wi-Fi 故障 | StickS3 有 8MB PSRAM 时优先 `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`；在 BLE 已初始化/已连接状态用超过旧失败边界的 HTTPS request 做 A/B 验收 |
 | 每个 BLE HID key 都发送 press + release | 打字速度只有必要 report 数量的一半 | 不同 key 可直接用下一份状态 report 替换，自动释放旧 key；相同连续 key 必须先发空 report，字符串结尾必须 release |
 | 看到 BGR 配置后又手动交换 RGB565 红蓝位 | 纯蓝显示红褐色或紫色，palette 无法直觉调整 | StickS3 实机 framebuffer 使用标准 RGB565；先用纯色块单独验证 element order |
 | 凭相近 ST7789 板型猜 panel 参数 | offset 对了但 inversion/order 错，反复调色仍不稳定 | 直接查 M5GFX `board_M5StickS3`：RGB order、`invert=true`、offset `(52,40)` |
