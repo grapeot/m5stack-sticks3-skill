@@ -238,3 +238,76 @@ if (read != sizeof(MyData) || out.version != 1) { /* reject or migrate */ }
 - key 名最长 15 字符
 - 单 key blob 可降低多个相关 key 分别更新时出现部分新值、部分旧值的风险
 - 不要依赖隐式 C++ struct layout；使用固定宽度字段、显式 padding/version，并校验读取长度
+
+## 省电优化
+
+### 禁用未使用的外设
+
+M5Unified 默认初始化 IMU、麦克风、扬声器等外设。如果固件不用这些，在 `M5.begin()` 前通过 config 关闭：
+
+```cpp
+auto cfg = M5.config();
+cfg.internal_imu = false;
+cfg.internal_mic = false;
+cfg.internal_spk = false;
+cfg.output_power = false;
+M5.begin(cfg);
+```
+
+这比 `M5.begin()` 后再 `M5.Speaker.end()` 更彻底——后者只关功放，前者连 I2C 初始化都跳过。
+
+### CPU 降频
+
+ESP32-S3 默认 240MHz。对于按钮 → WiFi 请求 → 显示文字这类简单应用，80MHz 完全够用，WiFi 和 TLS 在此频率仍可工作：
+
+```cpp
+setCpuFrequencyMhz(80);
+```
+
+240MHz ~33mA，80MHz ~22mA，省 ~11mA。
+
+### WiFi 省电
+
+```cpp
+WiFi.setSleep(true);
+WiFi.setTxPower(WIFI_POWER_13dBm);      // 室内 13dBm 够用
+esp_wifi_set_ps(WIFI_PS_MAX_MODEM);     // 最激进 modem sleep
+```
+
+需要 `#include "esp_wifi.h"`。如果连接不稳定降到 `WIFI_PS_MIN_MODEM`。
+
+### 背光管理
+
+```cpp
+M5.Display.setBrightness(128);  // 全亮
+M5.Display.setBrightness(26);   // ~20%，减暗
+M5.Display.setBrightness(0);    // 熄灭
+```
+
+建议三级：15 秒减暗 → 60 秒熄灭 → 120 秒 light sleep。
+
+### Light Sleep
+
+```cpp
+gpio_wakeup_enable(GPIO_NUM_11, GPIO_INTR_LOW_LEVEL);  // BtnA
+gpio_wakeup_enable(GPIO_NUM_12, GPIO_INTR_LOW_LEVEL);  // BtnB
+esp_sleep_enable_gpio_wakeup();
+esp_light_sleep_start();
+```
+
+唤醒后 WiFi 可能断开，需要检查 `WiFi.status()` 并重连。
+
+### Loop 延迟
+
+```cpp
+vTaskDelay(pdMS_TO_TICKS(50));  // 50ms 对按钮响应足够
+```
+
+更长的间隔减少 CPU 唤醒次数。
+
+### HTTPS 优化
+
+每次 TLS 握手很耗电。事务性设备应：
+- toggle 后不等待 2 秒再发确认 GET——乐观更新即可
+- 接受 2xx 而非只 200——SmartThings 可能返回 202 Accepted
+- 在一次唤醒周期内复用 `WiFiClientSecure` 连接
