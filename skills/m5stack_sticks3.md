@@ -8,11 +8,31 @@
 - **适用场景**: 在 M5StickS3 上开发 Arduino 或 ESP-IDF 固件，尤其是 IR、按钮、电源、ES8311 音频、RMT 和 NVS
 - **硬件**: M5StickS3 (ESP32-S3-PICO-1-N8R8, 8MB Flash, 8MB PSRAM)
 - **创建日期**: 2026-07-29
-- **最后验证**: 2026-07-29（ESP-IDF 5.5.5、`esp_codec_dev` 1.6.2）
+- **最后验证**: 2026-07-29（M5StickS3 SKU K150、ESP-IDF 5.5.5、`esp_codec_dev` 1.6.2、M5Stack Arduino core 3.3.8）
 
 ## 这个技能解决什么问题
 
-M5StickS3 是 M5Stack Stick 系列的最新产品，但它和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。社区固件（Bruce、NEMO）对 StickS3 的支持不成熟，有多个已知 bug。本技能记录在 StickS3 上从零开发固件所需的全部硬约束和踩坑经验，让后续 agent 不需要重复试错。
+M5StickS3 和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。本技能记录在 StickS3 上从零开发固件时已经由官方 board-support 源码确认或在实机复现的板级约束，让后续 agent 避免把相近型号经验直接套到 StickS3。
+
+### 边界
+
+本技能覆盖板级 bring-up：开发环境、引脚、按钮、电源、LCD、IR、ES8311 音频、NVS，以及这些外设对实时网络/BLE 应用的约束。它不提供特定电视、云服务或语音产品的完整实现，也不把单一设备上的现象推广成某个消费电子产品系列的通用结论。
+
+文中的结论分为三类：标注“实机验证”的内容已经在 SKU K150 上验证；引用 M5GFX/M5Unified/M5PM1 的内容来自官方 board-support 源码；其余代码片段是实现起点，必须经过下方验收，不应仅凭编译通过宣称硬件可用。
+
+### 验收标准
+
+一次新的 StickS3 固件 bring-up 至少满足适用项后才算完成：
+
+| 能力 | 验收方式 |
+|------|----------|
+| 构建与刷机 | 从干净 build 目录为 `esp32s3`/`m5stack_sticks3` 编译成功；115200 baud 刷写完成且 image hash 校验通过 |
+| 启动 | 串口确认芯片为 ESP32-S3、8MB Flash、8MB Octal PSRAM；无 boot loop |
+| 按钮 | BtnA/G11、BtnB/G12 各产生一次预期事件；PWR/reset 只作为恢复路径验证 |
+| LCD | 黑、白、纯红、纯绿、纯蓝色块位置和颜色正确；重复刷新无随机变色或 DMA 生命周期问题 |
+| 音频 | 24kHz、16-bit、mono 采集 1 秒得到 48,000 bytes，PCM 非全零且峰值随环境声音变化；codec identity readback 单独不算成功 |
+| IR（若使用） | 已关闭功放、开启 EXT_5V；已知 NEC 遥控器能稳定接收并通过反码/时序校验，回放由目标设备实际响应 |
+| 网络/BLE（若使用） | 状态与日志不回显 secret；BLE HID 检查 report 返回值，并完成长于 95 字符的连续实机输入测试 |
 
 ### 首要调试原则：查 board-support 源码，不猜
 
@@ -104,8 +124,11 @@ m5stack:esp32:m5stack_sticks3
 
 ### 库版本
 
-- M5Unified >= 0.2.12（推荐最新）
-- M5GFX >= 0.2.18（推荐最新）
+- M5Stack Arduino core 3.3.8（最近验证版本）
+- M5Unified >= 0.2.12
+- M5GFX >= 0.2.18
+
+为可复现构建固定实际使用的 core 和 library 版本；升级到最新版本是单独的兼容性变更，需要重新跑验收表。
 
 ### Sketch 目录结构
 
@@ -333,7 +356,7 @@ NEC 是最常见的电视遥控器协议。一次按键发送一个 32-bit 帧�
 
 ### NEC 解码校验（噪声过滤）
 
-StickS3 内置 IR 接收器对环境红外敏感。不校验的固件（如 Bruce）会把噪声帧显示出来。有效的 NEC 校验策略：
+StickS3 内置 IR 接收器对环境红外敏感。不做协议校验的固件会把环境噪声当作有效帧。有效的 NEC 校验策略：
 
 1. 引导码时间窗口：mark 8000-10000us, space 4000-5000us
 2. Repeat 帧检测：mark 8000-10000us, space 2000-3000us → 丢弃
@@ -442,7 +465,7 @@ StickS3 的 IPS ST7789P3 还需要 `esp_lcd_panel_invert_color(panel, true)`。�
 4. 音频可按 20-40ms chunk 处理，但 LCD 限制到约 10fps；显示值与最新采样值分开保存，避免限帧时漏掉最后一次回落。
 5. peak meter 使用快速 attack、较慢 release，可读性优于未平滑的瞬时振幅。
 
-小屏 UI 的实测可读模式是：状态 banner 全宽贴边，深色背景配浅色状态文字；banner 下方正文统一保留安全 margin。状态页可以放到 BtnB，显示 Wi-Fi、BLE 和 token 是否配置；如果显示 token 摘要，只保留开头/结尾并 mask 中间，绝不显示完整 secret。
+小屏 UI 的实测可读模式是：状态 banner 全宽贴边，深色背景配浅色状态文字；banner 下方正文统一保留安全 margin。状态页可以放到 BtnB，显示 Wi-Fi、BLE 和 token 是否配置。未认证状态接口、LCD、日志和配置页不得返回完整或截断 token；只显示 `configured` / `not configured`。配置输入框保持空白，只把非空新值解释为替换操作。
 
 ### 实时 WebSocket 语音路径
 
@@ -463,14 +486,15 @@ prefs.putULong("key", value);
 // 读（带默认值）
 uint32_t val = prefs.getULong("key", 0);
 
-// blob 存储结构体（推荐，原子写入）
-struct MyData { uint32_t code; uint8_t addr; };
-MyData data = {0x12345678, 0x10};
+// 单 key blob，显式版本和固定宽度字段便于迁移
+struct MyData { uint8_t version; uint8_t addr; uint16_t reserved; uint32_t code; };
+MyData data = {1, 0x10, 0, 0x12345678};
 prefs.putBytes("slot0", &data, sizeof(MyData));
 
 // 读 blob
-MyData out;
+MyData out = {};
 size_t read = prefs.getBytes("slot0", &out, sizeof(MyData));
+if (read != sizeof(MyData) || out.version != 1) { /* reject or migrate */ }
 
 // 检查 key 是否存在
 if (!prefs.isKey("slot0")) { /* 空槽 */ }
@@ -481,78 +505,22 @@ prefs.remove("slot0");
 
 ### NVS 踩坑
 
-- 用 `putBytes` / `getBytes` 存单个 blob 比 `putULong` + `putUChar` 多次写入更安全——多次写入在断电时可能只写了一半，blob 是原子操作
+- 用单个 key 保存 blob 可降低多个 key 分别更新时出现部分新、部分旧状态的风险；不要依赖原始 C++ struct layout，必须包含版本、固定宽度字段，并校验读取长度
 - `prefs.begin()` 可能失败，检查返回值
 - key 名最长 15 字符（NVS 限制）
 - namespace 名最长 15 字符
 
-## Bruce 固件在 StickS3 上的已知问题
+## BLE HID 应用约束
 
-Bruce (v1.16) 支持 StickS3 但有多个 bug：
+BLE HID 不是 StickS3 专属外设，但它常与本板的按钮、音频和网络链路组合。以下陷阱已经在 StickS3 实机出现：
 
-1. **黑屏/背光初始化 bug**（GitHub issue #2371）：board 初始化代码覆盖了背光 PWM 值导致屏幕全黑，绿灯闪烁。v1.16 的 prebuilt binary 可能未包含修复。
-2. **IR Read 抓到噪声**：不校验 NEC 帧，把所有 RMT 接收到的信号都显示出来，包括环境噪声。每次值不同。
-3. **按钮映射问题**（GitHub issue #2148）：外部 issue 报告按钮行为异常；其物理键命名与本 skill 的 BtnA/BtnB/PWR 口径不一致，引用时不要据此改写已验证映射。
-4. **RAM 报错**：麦克风录音报 "Not enough RAM"，尽管 StickS3 有 8MB PSRAM。
-
-**结论：Bruce 在 StickS3 上不适合做严肃的 IR 工具。自己写固件更可控。**
-
-## 三星 SolarCell Smart Remote 的 IR 问题
-
-三星高端 TV（Neo QLED 8K 等）配的 SolarCell Smart Remote（如 VG-TM2360E / TM2360E）默认走 **Bluetooth/RF**，不是红外。这类遥控器有 IR 发射能力但出厂可能不开 IR 模式，导致 IR Copier 抓不到任何信号。
-
-### 诊断方法
-
-用手机摄像头（数码摄像头能看到红外光）对着遥控器顶部发射窗，按任意键。如果画面里有紫色/白色闪烁 = 红外在发；完全没反应 = Bluetooth-only 模式。
-
-### 激活 IR 模式
-
-同时按住遥控器上的 **Return + Play/Pause** 约 10 秒，遥控器重启并清除蓝牙配对。重新配对后 IR 功能恢复。
-
-### 快速验证
-
-即使蓝牙配对后，**电源键和音量键通常始终走 IR**。如果只想测试 IR Copier 能不能抓到码，先按电源键或音量键。其他智能功能键（Home、方向键等）可能只走蓝牙。
-
-## 三星电视控制：红外 vs SmartThings API
-
-### 红外方案（不适用于高端三星电视）
-
-三星 Neo QLED 8K 等高端电视配的 SolarCell 遥控器（VG-TM2360E）日常**通过蓝牙控制电视**，红外只是 fallback。红外方案在以下环节全部失败：
-
-1. **Copy 失败**：SolarCell 遥控器的私有短协议（13 symbol / 21.5ms，76us mark）无法被 StickS3 IR 接收器正确解调
-2. **预设码回放失败**：IRremoteESP8266 `sendSAMSUNG()` 发送标准 Samsung32 码，电视无反应（电视不接受红外电源命令）
-
-### SmartThings API 方案（推荐）
-
-StickS3 通过 WiFi + SmartThings API 控制 Samsung 电视，完全绕过红外：
-
-1. **配置**：
-   - 电视添加到 SmartThings app
-   - 电视设置开启 "Power On with Mobile"（Settings → All Settings → Connections → Network → Expert Settings）
-   - 生成 SmartThings Personal Access Token（https://account.smartthings.com/tokens，需 `r:devices:*`、`w:devices:*`、`x:devices:*`）
-   - 查询 device ID：`curl -H "Authorization: Bearer TOKEN" https://api.smartthings.com/v1/devices`
-
-2. **API 调用**：
-   - 开关：`POST https://api.smartthings.com/v1/devices/{deviceId}/commands`，body `{"commands":[{"component":"main","capability":"switch","command":"on"}]}`
-   - 查状态：`GET https://api.smartthings.com/v1/devices/{deviceId}/components/main/status`
-   - 音量：capability=`audioVolume`，command=`volumeUp`/`volumeDown`
-   - 静音：capability=`audioMute`，command=`mute`
-
-3. **ESP32 实现**：`WiFiClientSecure` + `setInsecure()` 跳过证书验证，`HTTPClient` 发 POST
-
-4. **已知限制**：PAT 24 小时过期（2024-12-30 后创建的），长期方案需 OAuth2 app
-
-### 红外协议详情（供其他电视参考）
-
-三星遥控器使用 **Samsung32** 协议，时序与标准 NEC 类似但 header 不同。Samsung32 发送 address byte 两次（不是 address + inverse），然后 command + inverse。标准 Samsung power toggle = `0xE0E040BF`（address=0x07, command=0x02）。
-
-IRremoteESP8266 库的 `sendSAMSUNG(0xE0E040BF, 32)` 可以发送 Samsung32 码。注意 API 是全大写 `sendSAMSUNG`，不是 `sendSamsung`。
-
-### 重要：高端三星电视走蓝牙不走红外
-
-三星 Neo QLED 8K 等高端电视配的 SolarCell 遥控器（VG-TM2360E）日常**通过蓝牙控制电视**，红外只是 fallback。判断方法：在楼下按遥控器，楼上电视有反应 = 蓝牙控制。这种情况下直接发送 IR 码电视不会有反应。
-
-此外 SolarCell 遥控器的私有短协议（13 symbol / 21.5ms 帧，76us mark）无法被 StickS3 的 IR 接收器正确解调——76us 的 mark 太短，标准 IR 接收器需要至少 ~200us 连续载波才能识别。这意味着**无法可靠 copy 这个遥控器的信号**，只能用预设码发送。
+- NimBLE host task 必须在 `esp_hidd_dev_init()` 安装 sync callback 后启动，否则首次 sync event 可能丢失，设备不会 advertising。
+- iOS 配对需要与目标安全策略匹配；曾验证的 IDF 配置要求 `CONFIG_BT_NIMBLE_SM_LVL=2`。不要把固定 passkey 写成公开默认值。
+- advertising duration 使用 `BLE_HS_FOREVER`；示例中的 180 秒会让设备之后不可发现。
+- notification 会占用 mbuf 直到发出。扩大 msys pool、检查 `esp_hidd_dev_input_set()` 返回值，并使用有界重试；不要静默丢 report。
+- 延时必须至少一个 FreeRTOS tick。100Hz tick 下 5ms 会被截断为 0，10ms pacing 已通过连续 95 字符实机测试。
+- 不同 key 可以直接发送下一份状态 report；相同连续 key 必须先发空 report，字符串结束必须 final release。
+- ESP-IDF 项目必须在包含 `project.cmake` 前确定 `IDF_TARGET=esp32s3`，否则 clean build 可能生成错误 target。
 
 ## 已知陷阱汇总
 
@@ -567,7 +535,7 @@ IRremoteESP8266 库的 `sendSAMSUNG(0xE0E040BF, 32)` 可以发送 Samsung32 码�
 | 用旧版 IRremote 库 | 不兼容 ESP32-S3 RMT | 用 `driver/rmt_tx.h` / `driver/rmt_rx.h` |
 | RMT RX callback 返回值一律写死 | 误报调度状态或漏掉唤醒 | 只写 volatile 标志时返回 false；用 FromISR API 唤醒高优先级 task 时返回 wake 标志 |
 | NEC 解码用单一阈值 `space > 1000` | 噪声和异常 space 被接受 | 用窗口：0 = 300-1000us, 1 = 1200-2200us |
-| NVS 多次 putULong/putUChar | 断电时可能只写入部分字段 | 用 putBytes 存单个 blob |
+| NVS 多次更新相关 key | 断电时可能出现部分新值、部分旧值 | 用带版本和固定宽度字段的单 key blob，并校验长度 |
 | 拔 USB 后设备不重启 | 电池供电，拔 USB 不断电 | 双击 PWR 关机后单击开机，或短按 PWR 复位 |
 | 把 ES8311 供电误认成 BOOST 5V | ES8311 身份寄存器读取失败或 codec 未上电 | 打开 M5PM1 LDO_EN/LDO_HOLD，并将 GPIO2 `PYG2_L3B_EN` 输出高电平 |
 | 手抄部分 ES8311 寄存器 | 身份 readback 正常但 PCM 严格全零 | 使用 `esp_codec_dev_open()` + `esp_codec_dev_set_in_gain()` 完成 open/enable/gain 状态机 |
@@ -591,9 +559,8 @@ IRremoteESP8266 库的 `sendSAMSUNG(0xE0E040BF, 32)` 可以发送 Samsung32 码�
 - M5Stack 官方文档: https://docs.m5stack.com/en/core/StickS3
 - M5Stack IR NEC 例程: https://docs.m5stack.com/en/arduino/m5sticks3/ir_nec
 - M5Unified GitHub: https://github.com/m5stack/M5Unified
+- M5GFX GitHub（查 `board_M5StickS3`）: https://github.com/m5stack/M5GFX
 - M5PM1 按键与电源控制: https://github.com/m5stack/M5PM1
-- Bruce 固件: https://bruce.computer
-- Bruce 固件 StickS3 issue: https://github.com/BruceDevices/firmware/issues/2371
 
 ## 安装方式
 

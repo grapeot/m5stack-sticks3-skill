@@ -1,6 +1,6 @@
 # M5StickS3 开发技能
 
-面向 AI agent 的 M5StickS3 嵌入式开发指南。覆盖环境搭建、固件编译上传、IR 红外收发、按钮系统、电源管理以及已踩过的坑。
+面向 AI agent 的 M5StickS3 嵌入式开发指南。覆盖可验证的板级 bring-up、固件编译上传、IR 红外收发、按钮、电源、LCD、ES8311 音频、NVS 和 BLE HID 陷阱。
 
 ## 安装
 
@@ -8,7 +8,7 @@
 
 ## 内容
 
-- `skills/m5stack_sticks3.md` — 完整技能文件，包含硬件引脚、开发环境、RMT IR 驱动、按钮系统、NEC 协议、NVS 存储、已知陷阱
+- `skills/m5stack_sticks3.md` — canonical skill，包含硬件引脚、验收标准、开发环境、RMT IR、按钮、电源、LCD、ES8311、NVS 和已知陷阱
 
 ## 许可证
 
