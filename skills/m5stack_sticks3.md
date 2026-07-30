@@ -225,6 +225,8 @@ BLE HID 约束（NimBLE、iOS 配对、report 节奏）见 `m5stack_sticks3_esp_
 | 音量条每个 audio chunk 多次清屏/填色 | meter 闪烁，按钮和录音链路变迟钝 | 音频先入队；静态 framebuffer 一次合成、一次 DMA，LCD 限制约 10fps |
 | drawHeader 不设字体 | 继承前一个屏幕的字体，显示异常 | 封装函数内显式 setFont |
 | 底部文字用大字体 | 超出 135 像素屏幕高度被裁剪 | 底部用 Font0，y 不超过 130 |
+| WiFi 持续连接不设 modem sleep | 整机发烫、电池快速耗尽 | `WiFi.setSleep(true)` 开启 modem sleep；loop 里用 `vTaskDelay` 替代 `delay` 让 CPU 进 idle |
+| loop 里用 delay() 忙转 | CPU 不降频，持续发热 | 用 `vTaskDelay(pdMS_TO_TICKS(10))` 替代 `delay(10)` |
 
 ## 参考资源
 
