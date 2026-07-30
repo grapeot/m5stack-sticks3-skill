@@ -8,7 +8,9 @@
 
 ## 内容
 
-- `skills/m5stack_sticks3.md` — canonical skill，包含硬件引脚、验收标准、开发环境、RMT IR、按钮、电源、LCD、ES8311、NVS 和已知陷阱
+- `skills/m5stack_sticks3.md` — canonical root skill，包含硬件引脚、跨框架边界、验收标准和已知陷阱
+- `skills/m5stack_sticks3_esp_idf.md` — ESP-IDF 裸驱 LCD、ES8311、BLE HID、实时 WebSocket 和 token UI 边界
+- `skills/m5stack_sticks3_m5unified.md` — Arduino/M5Unified 环境、显示、按钮、RMT IR 和 NVS
 
 ## 许可证
 
