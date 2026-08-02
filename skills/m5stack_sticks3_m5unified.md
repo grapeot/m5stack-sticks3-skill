@@ -77,6 +77,19 @@ arduino-cli upload \
 
 macOS 上设备通常显示为 `/dev/cu.usbmodem*`；数字后缀由系统动态分配，不能写死为 `101`。
 
+### Arduino 自主测试闭环
+
+Arduino/M5Unified 固件也应提供与 ESP-IDF 路径相同的机器验收能力，而不是停在 `arduino-cli upload` 成功。开发构建可在 `loop()` 中读取 newline-delimited serial 命令，将逻辑事件或固定输入送入产品正在使用的函数，再返回单行结构化结果。
+
+最小契约包含：
+
+- 启动完成后输出 `READY build_id=<id> target=m5stack_sticks3`。
+- 命令携带唯一 `request_id`、测试名，以及 payload 的长度/hash。
+- 结果回显 `build_id`、`request_id`、`status`、耗时、原始测量和具体错误。
+- host runner 自动发现 `/dev/cu.usbmodem*`，拒绝不匹配的旧 `build_id`，并以 exit code 表示断言结果。
+
+按钮逻辑可抽成同时接受 `M5.BtnA`/`M5.BtnB` 事件和 test command 的函数，便于 agent 自动遍历状态机；最终仍要实按 BtnA/BtnB 验证 GPIO 和 Button_Class 行为。显示测试可以由命令切换纯色和布局，但颜色、裁切和闪烁必须在屏幕上验收。进入 light/deep sleep 前应先发送终态、`Serial.flush()`，并保留可恢复路径。
+
 ## 显示
 
 ### 基本用法

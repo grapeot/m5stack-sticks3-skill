@@ -12,6 +12,49 @@
 - PSRAM：8MB **Octal/OPI**，不能配成 Quad/QSPI
 - 没有 M5Stack 专用 FQBN，使用通用 `esp32-s3-devkitc-1` 配置
 
+## 自主构建、刷写与验收
+
+原生 USB Serial/JTAG 的正常开发路径不是“每次手工进 download mode”，而是从运行态直接让 `idf.py` 自动复位、刷写和重启：
+
+```bash
+. "$IDF_PATH/export.sh"
+idf.py build
+idf.py -p /dev/cu.usbmodemXXX -b 115200 flash
+```
+
+在 M5StickS3 SKU K150 + ESP-IDF 5.5.5 上，运行态到运行态的全自动循环已经实机验证。115200 baud 是已验证的可靠刷写速率；更高 baud 即使写入看似完成，也可能在 MD5/hash 校验阶段失败。
+
+Agent 应把“自主迭代能力”本身当作 bring-up 验收项：第一次人工恢复到可运行状态后，再执行一次无按键 flash，并通过网络 health/status 或等价机器可读信号确认新固件恢复运行。后续调试、最小复现和二分实验都从这个已知可工作的闭环开始逐项加回变量。
+
+能力边界：应用若重配 GPIO19/GPIO20、关闭 USB Serial/JTAG、进入 deep sleep，或 light sleep 使 USB controller/PHY 不可响应，主机端口可能消失，此时无法从主机发起自动 download。先尝试网络控制面恢复；两条控制面都不可用时，才请求用户长按 PWR/reset 至绿灯闪烁做一次恢复刷写。不要把“已停在手工触发的 ROM download mode 后 hard reset 行为异常”和“正常运行态不能自动刷写”混为一谈。
+
+不要用 `esptool run` 默认行为替代标准 flash-to-run 验收：该命令执行用户代码后仍可能按默认 `--after=hard_reset` 再次复位，观察到的最终状态容易误导。也不要在验证自动重启时立刻重新打开 serial monitor；USB CDC 的控制线变化可能增加一次 `USB_UART_CHIP_RESET`。先从独立控制面确认应用，再按需采集串口。
+
+### 可测固件接口
+
+为持续实验保留一个可编译开关控制的 test mode。它应复用 production component 和 task，只增加命令解析、输入注入及结构化 telemetry；不要复制一套简化业务逻辑。USB serial 适合 bring-up，已有网络栈时也可以提供只在开发构建启用的本地 endpoint。
+
+一个足够的串口协议如下：
+
+```text
+READY build_id=<git-sha-or-content-hash> target=esp32s3 reset_reason=<reason>
+RUN request_id=<id> test=<name> input_len=<n> input_hash=<hash>
+RESULT build_id=<id> request_id=<id> test=<name> status=<pass|fail|error> elapsed_ms=<n> ...
+```
+
+实现与验收约束：
+
+- `READY` 只能在测试命令所需组件初始化完成后发送；重启后必须重新发送。
+- 长 payload 应带长度和轻量 hash，设备先校验完整性，再运行真实的预处理和目标函数。
+- `RESULT` 在 deep sleep、软件重启或关闭 USB 前完成输出和 flush；失败返回原始 `esp_err_t`、底层状态和关键 telemetry。
+- parser 对未知命令、超长输入和重复 `request_id` 给出确定错误，不因调试输入破坏正常任务。
+- host runner 将 reset、错误结果、parse failure 和 timeout 映射为非零 exit code，并保存原始 transcript。
+- 性能验收同时记录时间、free internal heap、largest free block；使用 PSRAM 时另记 free PSRAM。仅记录总 heap 容易漏掉连续内存耗尽。
+
+对于摄像头、音频、模型推理或协议转换，测试 payload 应穿过与产品相同的采集后处理、量化/推理和输出解码代码。设备回传 raw output 与最终判断，主机用独立 expected result 断言；不要只让设备回传它自己计算的 `pass`。
+
+控制面和产品功能争用 USB、GPIO19/GPIO20、内存或时序时，先用最小 measurement firmware 建立基线，再逐项加回组件。最后仍需在完整构建中重跑同一 probe，证明测量工具没有掩盖集成故障。
+
 ## ST7789P3 LCD 裸驱
 
 ### 面板参数（来自 M5GFX board-support 源码）
@@ -78,6 +121,28 @@ pmic_update(0x11, 0, BIT(2));      // GPIO2 high，L3B on
 - notification 会占用 mbuf，检查 `esp_hidd_dev_input_set()` 返回值
 - 延时必须至少一个 FreeRTOS tick；100Hz tick 下 5ms 会被截断为 0，10ms pacing 已通过连续 95 字符实机测试
 - 不同 key 可直接发下一份状态 report；相同连续 key 必须先发空 report，字符串结束必须 final release
+
+### NimBLE、TLS 与 internal RAM
+
+StickS3 同时运行 NimBLE HID 和 HTTPS 时，不要默认把 NimBLE host allocations 全放 internal RAM。HID 为避免 notification 截断，常会提高 msys/ACL buffer 数量；这些 buffer、NimBLE host state、TLS record buffer 和网络栈会争用有限且需要连续块的 internal heap。典型表象不是明确的 `ESP_ERR_NO_MEM`，而是 TLS connect 失败，或大 body 写到约 10-20KB 后 `esp_http_client_write()` 等满 timeout、返回 0，`esp_http_client_get_errno()` 仍为 0。这很容易误判成 MTU black hole、TCP ACK 丢失或 Wi-Fi/BLE airtime coexistence。
+
+有 8MB Octal PSRAM 的 StickS3 优先配置：
+
+```text
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+# CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL is not set
+```
+
+该配置只迁移允许放 external RAM 的 NimBLE host allocations；BLE controller 仍按芯片要求使用内部资源。不要用关闭 BLE、缩小业务 request 或断开 HID 连接作为正式 workaround。
+
+实机诊断采用逐层单变量 A/B：
+
+1. 最小 TLS 固件验证大 body、multipart、write chunk、timeout 和网络 Kconfig。
+2. 完整固件暂不初始化 BLE；若上传恢复，边界落在 BLE runtime。
+3. 初始化 NimBLE 但不 advertising；若仍失败，排除 active connection 和 radio airtime contention。
+4. 单独切换 NimBLE allocation mode；恢复 advertising 和已配对 HID 后连续上传多次。
+
+在 SKU K150、ESP-IDF 5.5.5 上，internal mode 下即使禁止 advertising、没有 BLE connection，完整应用仍无法完成同一 TLS probe；关闭 BLE 可成功。关闭 BLE controller modem sleep 无改善。仅切换为 external mode 后，在 HID 已连接状态连续三次完成 65,769-byte multipart HTTPS request 并收到 HTTP 200。因此验收不能只看 BLE 能否打字和 HTTPS 小请求能否成功，必须组合测试“BLE connected + 大于历史失败边界的 TLS upload”。
 
 ## 动态 UI 与实时音频
 

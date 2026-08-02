@@ -12,7 +12,7 @@
 - **适用场景**: 在 M5StickS3 上开发 Arduino 或 ESP-IDF 固件，尤其是 IR、按钮、电源、ES8311 音频、RMT 和 NVS
 - **硬件**: M5StickS3 (ESP32-S3-PICO-1-N8R8, 8MB Flash, 8MB PSRAM)
 - **创建日期**: 2026-07-29
-- **最后验证**: 2026-07-29（M5StickS3 SKU K150、ESP-IDF 5.5.5、`esp_codec_dev` 1.6.2、M5Stack Arduino core 3.3.8）
+- **最后验证**: 2026-07-30（M5StickS3 SKU K150、ESP-IDF 5.5.5、`esp_codec_dev` 1.6.2、M5Stack Arduino core 3.3.8）
 
 ## 这个技能解决什么问题
 
@@ -20,7 +20,7 @@ M5StickS3 和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。本
 
 ### 边界
 
-本技能覆盖板级 bring-up：开发环境、引脚、按钮、电源、LCD、IR、ES8311 音频、NVS，以及这些外设对实时网络/BLE 应用的约束。它不提供特定电视、云服务或语音产品的完整实现，也不把单一设备上的现象推广成某个消费电子产品系列的通用结论。
+本技能覆盖板级 bring-up：开发环境、可供 agent 驱动的测试控制面、引脚、按钮、电源、LCD、IR、ES8311 音频、NVS，以及这些外设对实时网络/BLE 应用的约束。它不提供特定电视、云服务或语音产品的完整实现，也不把单一设备上的现象推广成某个消费电子产品系列的通用结论。
 
 文中的结论分为三类：标注“实机验证”的内容已经在 SKU K150 上验证；引用 M5GFX/M5Unified/M5PM1 的内容来自官方 board-support 源码；其余代码片段是实现起点，必须经过下方验收，不应仅凭编译通过宣称硬件可用。
 
@@ -32,11 +32,12 @@ M5StickS3 和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。本
 |------|----------|
 | 构建与刷机 | 从干净 build 目录为 `esp32s3`/`m5stack_sticks3` 编译成功；115200 baud 刷写完成且 image hash 校验通过 |
 | 启动 | 串口确认芯片为 ESP32-S3、8MB Flash、8MB Octal PSRAM；无 boot loop |
+| 自主迭代 | 完成一次无需物理按键的“运行态 → 刷写 → 读取新 build identity → 发送测试命令 → 收到关联的结构化结果 → 主机断言”；结果来自 StickS3 上的真实业务路径，不是 host stub |
 | 按钮 | BtnA/G11、BtnB/G12 各产生一次预期事件；PWR/reset 只作为恢复路径验证 |
 | LCD | 黑、白、纯红、纯绿、纯蓝色块位置和颜色正确；重复刷新无随机变色或 DMA 生命周期问题 |
 | 音频 | 24kHz、16-bit、mono 采集 1 秒得到 48,000 bytes，PCM 非全零且峰值随环境声音变化；codec identity readback 单独不算成功 |
 | IR（若使用） | 已关闭功放、开启 EXT_5V；已知 NEC 遥控器能稳定接收并通过反码/时序校验，回放由目标设备实际响应 |
-| 网络/BLE（若使用） | 状态与日志不回显 secret；BLE HID 检查 report 返回值，并完成长于 95 字符的连续实机输入测试 |
+| 网络/BLE（若使用） | 状态与日志不回显 secret；BLE HID 检查 report 返回值，并完成长于 95 字符的连续实机输入测试；同时使用 TLS 时，在 BLE 已连接状态完成一笔大于历史失败边界的上传 |
 
 ### 首要调试原则：查 board-support 源码，不猜
 
@@ -160,6 +161,85 @@ esptool 刷完后会自动发 hard reset，设备应从 flash 启动。如果因
 - 短按一下 PWR/reset 键（单击 = 硬件复位，会从 flash 正常启动）
 - 如果短按也没用，双击 PWR 关机，再单击开机
 
+### 优先建立自主刷写闭环
+
+StickS3 的原生 USB Serial/JTAG 支持从正常运行态自动进入 ROM download mode。只要应用没有关闭或重配 USB、设备没有进入会让 USB 失效的睡眠状态、主机仍能看到 CDC 端口，就应直接执行：
+
+```bash
+idf.py -p /dev/cu.usbmodemXXX -b 115200 flash
+```
+
+实机验证的稳定闭环是：
+
+```text
+正常运行态
+  → esptool 通过 USB Serial/JTAG 自动进入 download mode
+  → 115200 baud 写入并校验 image hash
+  → --after=hard_reset
+  → 新固件正常运行
+  → 通过网络 status/health 接口确认版本或测试结果
+```
+
+这应当是 agent 的默认开发循环。**不要每次刷写前都让用户长按 PWR/reset 进入下载模式。** 物理按键是恢复手段，不是正常迭代步骤。第一次 bring-up 或固件已经破坏 USB 通路时，可以请用户做一次物理恢复；设备回到正常运行态后，应立即验证并保护上述自主闭环。
+
+刷写后的验收也要避免改变被测状态。USB CDC/monitor 的打开、关闭和 DTR/RTS 操作可能再次触发 `USB_UART_CHIP_RESET`；设备本来停在 ROM download mode 时，打开 monitor 只会再次看到 `DOWNLOAD(USB/UART0)`，不能据此证明刚才的应用从未启动。优先用网络 health/status、LED 测试模式或其他独立信号确认运行。需要串口日志时，再明确把“观察应用”和“触发 reset”分开设计。
+
+#### 何时才请求用户介入
+
+先检查端口、当前网络状态和 esptool 连接结果，再决定是否需要物理操作：
+
+| 当前状态 | Agent 行为 |
+|----------|------------|
+| 应用正常运行，USB CDC 端口存在 | 直接自动刷写；不要请求按键 |
+| 刷写成功且网络 health/status 恢复 | 自主闭环成立，继续迭代 |
+| 设备已停在物理触发的 ROM download mode，刷后仍未运行 | 请求短按一次 PWR/reset；回到运行态后重新验证自动刷写 |
+| CDC 端口消失，但设备仍在网络上 | 检查 light/deep sleep、USB pin/console 配置；优先通过网络命令恢复或重启 |
+| CDC 和网络都不可达、固件 boot loop、USB 被重配 | 明确请求长按 PWR/reset 至绿灯闪烁，只做一次恢复刷写 |
+| 电源状态不明或短按无效 | 请求双击关机再单击开机，随后恢复自主闭环 |
+
+请求用户帮助时，要说明**为什么机器已经越过自主能力边界、需要做哪个动作、预期把设备送到什么状态**。用户完成后 agent 应立即继续，不把后续机器可完成的步骤再交还给用户。
+
+### 从自主刷写升级为自主实验
+
+刷写成功只证明 image 可以写入，不能证明目标功能成立。高效的 agent 开发循环应形成下面的闭环：
+
+```text
+修改源码 → clean build → flash/hash verify → 读取新 build identity
+        → 机器触发一个测试 → 设备执行真实业务路径
+        → 返回结构化结果和原始测量 → 主机断言 → 保留失败证据或继续迭代
+```
+
+固件应暴露一个最小测试控制面，可以使用 USB serial、网络或 BLE，但必须满足以下结果契约：
+
+- 启动后输出唯一的 `build_id` 或 git SHA，主机据此拒绝旧固件、旧端口和缓存响应。
+- 每条命令带 `request_id`；每次测试只有一个可关联的终态 `pass`、`fail` 或 `error`，并有明确 timeout。
+- 结果至少包含 `build_id`、`request_id`、测试名、状态、耗时、关键原始测量和错误细节。不要只输出自然语言 `OK`。
+- 测试入口调用产品固件正在使用的 preprocessing、driver、inference、storage 或 network 路径；只在边界注入可控输入，不另写一套永远成功的测试实现。
+- 固定输入记录长度/hash，随机流程记录 seed。主机应先验证输入完整性，再判断设备输出。
+- 日志明确标记 `simulator`、`host` 或 `device`。只有结果确实由 StickS3 执行时才能标记 `device`。
+- 未认证控制面不接收或回显 secret；测试结果中的地址、token 和用户数据必须脱敏。
+
+协议不必复杂。line-delimited JSON 或稳定的 key-value 行就足够，例如：
+
+```text
+READY build_id=abc123 target=esp32s3
+RESULT build_id=abc123 request_id=17 test=audio_capture status=pass elapsed_ms=1032 bytes=48000 peak=812
+```
+
+主机 runner 负责发现动态端口、等待匹配的 `READY`、发送命令、验证 `request_id` 和输入 hash、解析结果并以非零 exit code 表示断言失败。完整原始串口记录应作为失败证据保留；CLI 不要把 timeout、设备重启或底层错误压缩成笼统的 `test failed`。
+
+当完整应用无法解释故障时，优先做最小 measurement firmware，而不是继续猜。它只保留当前被测链路及其供电、时钟和输入，输出可量化的原始结果；确认基线后再逐项加回显示、网络、BLE、存储和睡眠。每次只改变一个主要变量，并保留最后一个通过的 firmware hash，便于二分回归和恢复。
+
+### 自动化边界
+
+测试控制面可以注入按钮对应的逻辑事件、固定 PCM、网络 payload 或其他确定输入，从而减少重复人工操作，但不能把注入结果冒充物理验收。以下边界仍需要真实设备或用户动作：
+
+- 首次接线、USB 控制面完全失联后的恢复，以及移动、遮挡或对准设备。
+- 按钮电气/机械行为、LCD 实际颜色与布局、扬声器声音、麦克风环境响应、IR/RF 目标响应和真实功耗。
+- deep sleep、USB 重配置或 GPIO19/GPIO20 用途会主动切断控制面时的最终场景验收。
+
+进入会切断控制面的状态前，先输出最终结构化结果并等待传输完成，同时保留定时唤醒、网络恢复命令或已知可工作的恢复 image。Agent 应把人工动作压缩到这些物理边界，而不是把整轮构建、刷写和日志判断交给用户。
+
 ### 电池与电源保持
 
 StickS3 内置 250mAh 电池。**拔插 USB 不会强制重启设备**（电池持续供电）。
@@ -194,6 +274,8 @@ NVS 用法见 `m5stack_sticks3_m5unified.md`。
 
 BLE HID 约束（NimBLE、iOS 配对、report 节奏）见 `m5stack_sticks3_esp_idf.md`。
 
+标准 HID keyboard report 传输键位，不保证直接输入中文或任意 Unicode。iOS 对 HID Unicode Page、`\uXXXX` 键盘扩展替换方案的边界，以及推荐的 UTF-8 + Custom Keyboard 架构见 [`docs/ios_chinese_input.md`](../docs/ios_chinese_input.md)。
+
 ## 已知陷阱汇总
 
 | 陷阱 | 表现 | 应对 |
@@ -213,9 +295,17 @@ BLE HID 约束（NimBLE、iOS 配对、report 节奏）见 `m5stack_sticks3_esp_
 | 手抄部分 ES8311 寄存器 | 身份 readback 正常但 PCM 严格全零 | 使用 `esp_codec_dev_open()` + `esp_codec_dev_set_in_gain()` 完成 open/enable/gain 状态机 |
 | 误以为需要 GPIO4 HOLD | 不必要地占用 GPIO4，或误删音频 `LDO_HOLD` | 主电源不需要 GPIO4 HOLD；音频 L3B 仍需 M5PM1 `LDO_HOLD` |
 | 进入下载模式用按 BOOT 插 USB | StickS3 没有 BOOT 键，操作无效 | 连 USB 后长按侧边 PWR/reset 直到绿灯闪 |
+| 每次刷写前都要求用户长按 PWR/reset | 人为打断可自动化的开发循环，无法连续实验或二分回归 | 运行态且 CDC 端口存在时直接 `idf.py ... flash`；物理 download mode 只用于恢复 |
+| 用重新打开 serial monitor 作为刷后唯一验收 | DTR/RTS 或 USB CDC open 再次触发 reset，观察动作改变设备状态 | 刷后先用网络 health/status 或独立信号验收；串口观察与 reset 控制分开 |
+| 把 build/flash 成功当成功能验收 | image hash 正确，但新固件未启动、输入损坏或真实业务路径仍失败 | 校验新 `build_id`，再完成“命令 → device 结果 → host 断言”闭环 |
+| 测试固件另写一套简化实现 | 测试全绿，产品中的 preprocessing、driver 或 postprocessing 仍有 bug | 复用产品路径，只在输入和输出边界增加控制面与 telemetry |
+| 测试结果没有 build/request identity | 把旧端口、重启前日志或上一次响应误判为当前实验 | 每条 `READY`/`RESULT` 带 `build_id`，每个测试带唯一 `request_id` |
+| 用 host/simulator 结果代替实机结果 | 本机算法通过，但芯片量化、内存、时序或外设路径失败 | 结果标记执行层；device 验收必须由 StickS3 运行并回传原始测量 |
+| 结果发完前进入 deep sleep | 主机 timeout，无法区分测试失败、日志未 flush 和 USB 消失 | 发送终态并等待传输完成后再睡眠；保留定时唤醒或恢复 image |
 | 把绿灯状态当成应用诊断 | 闪烁时误判崩溃，或从其他灯态推断应用正常 | 只把绿灯闪烁解释为 Download Mode；其他灯态不下结论 |
 | 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时连接 USB，长按 PWR/reset 直到绿灯闪烁 |
 | BLE HID 延时小于一个 FreeRTOS tick | 文字约 17 字符后截断，NimBLE 报 `Unable to fetch protocol_mode` | 检查 `CONFIG_FREERTOS_HZ`；100Hz 时 `pdMS_TO_TICKS(5)` 为 0。40 个 msys buffer 配合返回值检查和有界重试时，10ms 已通过连续 95 字符实机测试 |
+| NimBLE host buffer 全放 internal RAM，同时运行 TLS | TLS connect 或大 body write 失败，`esp_http_client_write()` 可能返回 0 且 socket errno 仍为 0，看起来像 MTU、ACK 或 Wi-Fi 故障 | StickS3 有 8MB PSRAM 时优先 `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`；在 BLE 已初始化/已连接状态用超过旧失败边界的 HTTPS request 做 A/B 验收 |
 | 每个 BLE HID key 都发送 press + release | 打字速度只有必要 report 数量的一半 | 不同 key 可直接用下一份状态 report 替换，自动释放旧 key；相同连续 key 必须先发空 report，字符串结尾必须 release |
 | 看到 BGR 配置后又手动交换 RGB565 红蓝位 | 纯蓝显示红褐色或紫色，palette 无法直觉调整 | StickS3 实机 framebuffer 使用标准 RGB565；先用纯色块单独验证 element order |
 | 凭相近 ST7789 板型猜 panel 参数 | offset 对了但 inversion/order 错，反复调色仍不稳定 | 直接查 M5GFX `board_M5StickS3`：RGB order、`invert=true`、offset `(52,40)` |
