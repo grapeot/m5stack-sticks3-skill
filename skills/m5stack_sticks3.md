@@ -20,7 +20,7 @@ M5StickS3 和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。本
 
 ### 边界
 
-本技能覆盖板级 bring-up：开发环境、引脚、按钮、电源、LCD、IR、ES8311 音频、NVS，以及这些外设对实时网络/BLE 应用的约束。它不提供特定电视、云服务或语音产品的完整实现，也不把单一设备上的现象推广成某个消费电子产品系列的通用结论。
+本技能覆盖板级 bring-up：开发环境、可供 agent 驱动的测试控制面、引脚、按钮、电源、LCD、IR、ES8311 音频、NVS，以及这些外设对实时网络/BLE 应用的约束。它不提供特定电视、云服务或语音产品的完整实现，也不把单一设备上的现象推广成某个消费电子产品系列的通用结论。
 
 文中的结论分为三类：标注“实机验证”的内容已经在 SKU K150 上验证；引用 M5GFX/M5Unified/M5PM1 的内容来自官方 board-support 源码；其余代码片段是实现起点，必须经过下方验收，不应仅凭编译通过宣称硬件可用。
 
@@ -32,7 +32,7 @@ M5StickS3 和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。本
 |------|----------|
 | 构建与刷机 | 从干净 build 目录为 `esp32s3`/`m5stack_sticks3` 编译成功；115200 baud 刷写完成且 image hash 校验通过 |
 | 启动 | 串口确认芯片为 ESP32-S3、8MB Flash、8MB Octal PSRAM；无 boot loop |
-| 自主迭代 | 完成一次无需物理按键的“运行态 → 自动进入下载态 → 刷写 → 自动回运行态”；刷后由网络 health/status 或等价机器信号确认新固件已运行 |
+| 自主迭代 | 完成一次无需物理按键的“运行态 → 刷写 → 读取新 build identity → 发送测试命令 → 收到关联的结构化结果 → 主机断言”；结果来自 StickS3 上的真实业务路径，不是 host stub |
 | 按钮 | BtnA/G11、BtnB/G12 各产生一次预期事件；PWR/reset 只作为恢复路径验证 |
 | LCD | 黑、白、纯红、纯绿、纯蓝色块位置和颜色正确；重复刷新无随机变色或 DMA 生命周期问题 |
 | 音频 | 24kHz、16-bit、mono 采集 1 秒得到 48,000 bytes，PCM 非全零且峰值随环境声音变化；codec identity readback 单独不算成功 |
@@ -199,6 +199,47 @@ idf.py -p /dev/cu.usbmodemXXX -b 115200 flash
 
 请求用户帮助时，要说明**为什么机器已经越过自主能力边界、需要做哪个动作、预期把设备送到什么状态**。用户完成后 agent 应立即继续，不把后续机器可完成的步骤再交还给用户。
 
+### 从自主刷写升级为自主实验
+
+刷写成功只证明 image 可以写入，不能证明目标功能成立。高效的 agent 开发循环应形成下面的闭环：
+
+```text
+修改源码 → clean build → flash/hash verify → 读取新 build identity
+        → 机器触发一个测试 → 设备执行真实业务路径
+        → 返回结构化结果和原始测量 → 主机断言 → 保留失败证据或继续迭代
+```
+
+固件应暴露一个最小测试控制面，可以使用 USB serial、网络或 BLE，但必须满足以下结果契约：
+
+- 启动后输出唯一的 `build_id` 或 git SHA，主机据此拒绝旧固件、旧端口和缓存响应。
+- 每条命令带 `request_id`；每次测试只有一个可关联的终态 `pass`、`fail` 或 `error`，并有明确 timeout。
+- 结果至少包含 `build_id`、`request_id`、测试名、状态、耗时、关键原始测量和错误细节。不要只输出自然语言 `OK`。
+- 测试入口调用产品固件正在使用的 preprocessing、driver、inference、storage 或 network 路径；只在边界注入可控输入，不另写一套永远成功的测试实现。
+- 固定输入记录长度/hash，随机流程记录 seed。主机应先验证输入完整性，再判断设备输出。
+- 日志明确标记 `simulator`、`host` 或 `device`。只有结果确实由 StickS3 执行时才能标记 `device`。
+- 未认证控制面不接收或回显 secret；测试结果中的地址、token 和用户数据必须脱敏。
+
+协议不必复杂。line-delimited JSON 或稳定的 key-value 行就足够，例如：
+
+```text
+READY build_id=abc123 target=esp32s3
+RESULT build_id=abc123 request_id=17 test=audio_capture status=pass elapsed_ms=1032 bytes=48000 peak=812
+```
+
+主机 runner 负责发现动态端口、等待匹配的 `READY`、发送命令、验证 `request_id` 和输入 hash、解析结果并以非零 exit code 表示断言失败。完整原始串口记录应作为失败证据保留；CLI 不要把 timeout、设备重启或底层错误压缩成笼统的 `test failed`。
+
+当完整应用无法解释故障时，优先做最小 measurement firmware，而不是继续猜。它只保留当前被测链路及其供电、时钟和输入，输出可量化的原始结果；确认基线后再逐项加回显示、网络、BLE、存储和睡眠。每次只改变一个主要变量，并保留最后一个通过的 firmware hash，便于二分回归和恢复。
+
+### 自动化边界
+
+测试控制面可以注入按钮对应的逻辑事件、固定 PCM、网络 payload 或其他确定输入，从而减少重复人工操作，但不能把注入结果冒充物理验收。以下边界仍需要真实设备或用户动作：
+
+- 首次接线、USB 控制面完全失联后的恢复，以及移动、遮挡或对准设备。
+- 按钮电气/机械行为、LCD 实际颜色与布局、扬声器声音、麦克风环境响应、IR/RF 目标响应和真实功耗。
+- deep sleep、USB 重配置或 GPIO19/GPIO20 用途会主动切断控制面时的最终场景验收。
+
+进入会切断控制面的状态前，先输出最终结构化结果并等待传输完成，同时保留定时唤醒、网络恢复命令或已知可工作的恢复 image。Agent 应把人工动作压缩到这些物理边界，而不是把整轮构建、刷写和日志判断交给用户。
+
 ### 电池与电源保持
 
 StickS3 内置 250mAh 电池。**拔插 USB 不会强制重启设备**（电池持续供电）。
@@ -256,6 +297,11 @@ BLE HID 约束（NimBLE、iOS 配对、report 节奏）见 `m5stack_sticks3_esp_
 | 进入下载模式用按 BOOT 插 USB | StickS3 没有 BOOT 键，操作无效 | 连 USB 后长按侧边 PWR/reset 直到绿灯闪 |
 | 每次刷写前都要求用户长按 PWR/reset | 人为打断可自动化的开发循环，无法连续实验或二分回归 | 运行态且 CDC 端口存在时直接 `idf.py ... flash`；物理 download mode 只用于恢复 |
 | 用重新打开 serial monitor 作为刷后唯一验收 | DTR/RTS 或 USB CDC open 再次触发 reset，观察动作改变设备状态 | 刷后先用网络 health/status 或独立信号验收；串口观察与 reset 控制分开 |
+| 把 build/flash 成功当成功能验收 | image hash 正确，但新固件未启动、输入损坏或真实业务路径仍失败 | 校验新 `build_id`，再完成“命令 → device 结果 → host 断言”闭环 |
+| 测试固件另写一套简化实现 | 测试全绿，产品中的 preprocessing、driver 或 postprocessing 仍有 bug | 复用产品路径，只在输入和输出边界增加控制面与 telemetry |
+| 测试结果没有 build/request identity | 把旧端口、重启前日志或上一次响应误判为当前实验 | 每条 `READY`/`RESULT` 带 `build_id`，每个测试带唯一 `request_id` |
+| 用 host/simulator 结果代替实机结果 | 本机算法通过，但芯片量化、内存、时序或外设路径失败 | 结果标记执行层；device 验收必须由 StickS3 运行并回传原始测量 |
+| 结果发完前进入 deep sleep | 主机 timeout，无法区分测试失败、日志未 flush 和 USB 消失 | 发送终态并等待传输完成后再睡眠；保留定时唤醒或恢复 image |
 | 把绿灯状态当成应用诊断 | 闪烁时误判崩溃，或从其他灯态推断应用正常 | 只把绿灯闪烁解释为 Download Mode；其他灯态不下结论 |
 | 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时连接 USB，长按 PWR/reset 直到绿灯闪烁 |
 | BLE HID 延时小于一个 FreeRTOS tick | 文字约 17 字符后截断，NimBLE 报 `Unable to fetch protocol_mode` | 检查 `CONFIG_FREERTOS_HZ`；100Hz 时 `pdMS_TO_TICKS(5)` 为 0。40 个 msys buffer 配合返回值检查和有界重试时，10ms 已通过连续 95 字符实机测试 |

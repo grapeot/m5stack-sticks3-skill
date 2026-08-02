@@ -1,6 +1,6 @@
 # M5StickS3 开发技能
 
-面向 AI agent 的 M5StickS3 嵌入式开发指南。覆盖可验证的板级 bring-up、运行态到运行态的自主刷写闭环、IR 红外收发、按钮、电源、LCD、ES8311 音频、NVS 和 BLE HID 陷阱。
+面向 AI agent 的 M5StickS3 嵌入式开发指南。覆盖可验证的板级 bring-up、构建/刷写/触发/测量/断言的自主迭代闭环、IR 红外收发、按钮、电源、LCD、ES8311 音频、NVS 和 BLE HID 陷阱。
 
 ## 安装
 

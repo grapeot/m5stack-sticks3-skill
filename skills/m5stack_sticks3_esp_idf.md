@@ -30,6 +30,31 @@ Agent 应把“自主迭代能力”本身当作 bring-up 验收项：第一次�
 
 不要用 `esptool run` 默认行为替代标准 flash-to-run 验收：该命令执行用户代码后仍可能按默认 `--after=hard_reset` 再次复位，观察到的最终状态容易误导。也不要在验证自动重启时立刻重新打开 serial monitor；USB CDC 的控制线变化可能增加一次 `USB_UART_CHIP_RESET`。先从独立控制面确认应用，再按需采集串口。
 
+### 可测固件接口
+
+为持续实验保留一个可编译开关控制的 test mode。它应复用 production component 和 task，只增加命令解析、输入注入及结构化 telemetry；不要复制一套简化业务逻辑。USB serial 适合 bring-up，已有网络栈时也可以提供只在开发构建启用的本地 endpoint。
+
+一个足够的串口协议如下：
+
+```text
+READY build_id=<git-sha-or-content-hash> target=esp32s3 reset_reason=<reason>
+RUN request_id=<id> test=<name> input_len=<n> input_hash=<hash>
+RESULT build_id=<id> request_id=<id> test=<name> status=<pass|fail|error> elapsed_ms=<n> ...
+```
+
+实现与验收约束：
+
+- `READY` 只能在测试命令所需组件初始化完成后发送；重启后必须重新发送。
+- 长 payload 应带长度和轻量 hash，设备先校验完整性，再运行真实的预处理和目标函数。
+- `RESULT` 在 deep sleep、软件重启或关闭 USB 前完成输出和 flush；失败返回原始 `esp_err_t`、底层状态和关键 telemetry。
+- parser 对未知命令、超长输入和重复 `request_id` 给出确定错误，不因调试输入破坏正常任务。
+- host runner 将 reset、错误结果、parse failure 和 timeout 映射为非零 exit code，并保存原始 transcript。
+- 性能验收同时记录时间、free internal heap、largest free block；使用 PSRAM 时另记 free PSRAM。仅记录总 heap 容易漏掉连续内存耗尽。
+
+对于摄像头、音频、模型推理或协议转换，测试 payload 应穿过与产品相同的采集后处理、量化/推理和输出解码代码。设备回传 raw output 与最终判断，主机用独立 expected result 断言；不要只让设备回传它自己计算的 `pass`。
+
+控制面和产品功能争用 USB、GPIO19/GPIO20、内存或时序时，先用最小 measurement firmware 建立基线，再逐项加回组件。最后仍需在完整构建中重跑同一 probe，证明测量工具没有掩盖集成故障。
+
 ## ST7789P3 LCD 裸驱
 
 ### 面板参数（来自 M5GFX board-support 源码）
