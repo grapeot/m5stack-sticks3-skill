@@ -182,6 +182,8 @@ idf.py -p /dev/cu.usbmodemXXX -b 115200 flash
 
 这应当是 agent 的默认开发循环。**不要每次刷写前都让用户长按 PWR/reset 进入下载模式。** 物理按键是恢复手段，不是正常迭代步骤。第一次 bring-up 或固件已经破坏 USB 通路时，可以请用户做一次物理恢复；设备回到正常运行态后，应立即验证并保护上述自主闭环。
 
+电池产品即使最终必须进入 deep sleep，也应在刷写或其他非 deep-sleep reset 后保留约 60 秒的不可缩短 awake 窗口，让 macOS 完成 USB Serial/JTAG 枚举并给 agent 留出验证、重刷时间。用 reset reason 区分这类启动和 GPIO deep-sleep wake：前者设置全局 `sleep_not_before`，所有较短 idle timer 都不能越过它；后者走正常产品时序。只在 UI 上延迟 60 秒不够，因为期间的按钮往返或任务完成可能重新设置更早的休眠 deadline。
+
 刷写后的验收也要避免改变被测状态。USB CDC/monitor 的打开、关闭和 DTR/RTS 操作可能再次触发 `USB_UART_CHIP_RESET`；设备本来停在 ROM download mode 时，打开 monitor 只会再次看到 `DOWNLOAD(USB/UART0)`，不能据此证明刚才的应用从未启动。优先用网络 health/status、LED 测试模式或其他独立信号确认运行。需要串口日志时，再明确把“观察应用”和“触发 reset”分开设计。
 
 #### 何时才请求用户介入
@@ -302,6 +304,7 @@ BLE HID 约束（NimBLE、iOS 配对、report 节奏）见 `m5stack_sticks3_esp_
 | 测试结果没有 build/request identity | 把旧端口、重启前日志或上一次响应误判为当前实验 | 每条 `READY`/`RESULT` 带 `build_id`，每个测试带唯一 `request_id` |
 | 用 host/simulator 结果代替实机结果 | 本机算法通过，但芯片量化、内存、时序或外设路径失败 | 结果标记执行层；device 验收必须由 StickS3 运行并回传原始测量 |
 | 结果发完前进入 deep sleep | 主机 timeout，无法区分测试失败、日志未 flush 和 USB 消失 | 发送终态并等待传输完成后再睡眠；保留定时唤醒或恢复 image |
+| 生产固件刷写后立即 deep sleep | macOS 尚未重新枚举 USB，CDC 端口消失，后续自动验证和重刷失去窗口 | 非 deep-sleep reset 后设置不可被短 idle timer 缩短的约 60 秒 `sleep_not_before`；GPIO 唤醒仍走正常产品时序 |
 | 把绿灯状态当成应用诊断 | 闪烁时误判崩溃，或从其他灯态推断应用正常 | 只把绿灯闪烁解释为 Download Mode；其他灯态不下结论 |
 | 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时连接 USB，长按 PWR/reset 直到绿灯闪烁 |
 | BLE HID 延时小于一个 FreeRTOS tick | 文字约 17 字符后截断，NimBLE 报 `Unable to fetch protocol_mode` | 检查 `CONFIG_FREERTOS_HZ`；100Hz 时 `pdMS_TO_TICKS(5)` 为 0。40 个 msys buffer 配合返回值检查和有界重试时，10ms 已通过连续 95 字符实机测试 |
