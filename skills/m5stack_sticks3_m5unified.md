@@ -134,6 +134,15 @@ M5.Display.drawString("Power: ON", 5, 50);
 - 底部文字不要超过 y=130（横屏 135 像素高），用 `Font0` 而非 `FreeMonoBold9pt7b`
 - 用 `M5.Display.width()` / `M5.Display.height()` 动态算坐标，不要硬编码分辨率
 
+### 全屏纯色 + HUD 叠加（刷新分层）
+
+"整屏纯色背景 + 角落小字"的显示（红绿灯、状态灯、角标计时器等）按分层刷新：
+
+- `fillScreen` **只在换色时做**。每秒整屏 `fillScreen` 会整屏闪烁，并把 SPI 带宽吃满。
+- 每秒更新的内容（倒计时、百分比）先 `fillRect` 清一个**固定区域**（按最大位数留宽），再重绘。数字位数变化（"20"→"9"）不清底会残留旧位 ghost。
+- 角落锚定文字用 `TR_DATUM`（右上角）/ `TL_DATUM`（左上角），y 取 `height() - 20` 左右（`Font0` size 2 字形高 16px），避免超出屏边被裁。
+- 实机验证过的布局：右下角倒计时、左下角电量，均为 `Font0` size 2 黑字、1 Hz 更新；状态切换时整屏 fill 一次，持续期间只重绘角落区域，无闪烁。
+
 ## 按钮
 
 M5Unified 的 Button_Class 提供（均需先调 `M5.update()`）：
@@ -268,6 +277,8 @@ M5.begin(cfg);
 ```
 
 这比 `M5.begin()` 后再 `M5.Speaker.end()` 更彻底——后者只关功放，前者连 I2C 初始化都跳过。
+
+注意：`M5.Power.getBatteryLevel()` 读电量走 M5PM1 I2C，与 `output_power`（EXT 5V 输出轨）开关无关——全部外设关闭后电量照常可读，不要误以为关外设把电量读坏了。
 
 ### CPU 降频
 

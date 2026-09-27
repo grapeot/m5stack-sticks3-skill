@@ -9,10 +9,10 @@
 ## 元数据
 
 - **类型**: BestPractice / API Guide
-- **适用场景**: 在 M5StickS3 上开发 Arduino 或 ESP-IDF 固件，尤其是 IR、按钮、电源、ES8311 音频、RMT 和 NVS
+- **适用场景**: 在 M5StickS3 上开发 Arduino 或 ESP-IDF 固件，尤其是 IR、按钮、电源、ES8311 音频、RMT、NVS 和多机 ESP-NOW 链路
 - **硬件**: M5StickS3 (ESP32-S3-PICO-1-N8R8, 8MB Flash, 8MB PSRAM)
 - **创建日期**: 2026-07-29
-- **最后验证**: 2026-07-30（M5StickS3 SKU K150、ESP-IDF 5.5.5、`esp_codec_dev` 1.6.2、M5Stack Arduino core 3.3.8）
+- **最后验证**: 2026-09-27（双机 ESP-NOW 无加密链路、显示 HUD 分层刷新、download mode 刷写后留 ROM 坑；M5Stack Arduino core 3.3.8、arduino-cli 1.5.1）；2026-07-30（M5StickS3 SKU K150、ESP-IDF 5.5.5、`esp_codec_dev` 1.6.2、M5Stack Arduino core 3.3.8）
 
 ## 这个技能解决什么问题
 
@@ -278,6 +278,31 @@ BLE HID 约束（NimBLE、iOS 配对、report 节奏）见 `m5stack_sticks3_esp_
 
 标准 HID keyboard report 传输键位，不保证直接输入中文或任意 Unicode。iOS 对 HID Unicode Page、`\uXXXX` 键盘扩展替换方案的边界，以及推荐的 UTF-8 + Custom Keyboard 架构见 [`docs/ios_chinese_input.md`](../docs/ios_chinese_input.md)。
 
+## ESP-NOW（多机无加密最小链路）
+
+双机同步、玩具级遥控等不需要认证/加密的场景，在 Arduino core 3.3.8（IDF 5.x）上已验证的最小配方：
+
+```cpp
+WiFi.mode(WIFI_STA);   // 不关联 AP
+esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);  // 两端固定同一信道
+esp_now_init();
+
+esp_now_peer_info_t peer = {};
+memcpy(peer.peer_addr, peer_mac, 6);
+peer.ifidx = WIFI_IF_STA;
+peer.channel = 1;
+peer.encrypt = false;
+esp_now_add_peer(&peer);
+esp_now_register_recv_cb(recv_cb);
+```
+
+- 收包回调签名以 IDF 5.x 为准：`void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)`；IDF 4.x 是 `(const uint8_t *mac, const uint8_t *data, int len)`，旧签名直接编不过。
+- 回调只做 memcpy 到局部 + 置 volatile 标志，状态机处理放主循环，与 IR RMT 回调的约束一致。
+- 单播必须先 `esp_now_add_peer`；peer 缺失时发送静默失败，不报错。
+- 两端信道不一致时帧被静默丢弃：没有 disconnect 事件、没有错误日志。排障第一步是两端各自 `esp_wifi_get_channel()` 核对。
+- **禁止跨设备传绝对 `millis()`**：每台设备的 `millis()` 以自己的开机为基准，两台之间的差是任意的（实测可达数十秒），接收端拿对端时间戳与本地相减会无符号下溢，时序/倒计时卡死。只传周期/相位内的相对时间，接收端用本地收包时刻锚定。
+- `esp_now_send()` 的返回值只表示提交给 driver，不代表对端收到；需要可靠性时应用层自己加序列号/心跳，或升级到加密单播 + 应用层认证的重型方案。
+
 ## 已知陷阱汇总
 
 | 陷阱 | 表现 | 应对 |
@@ -320,6 +345,12 @@ BLE HID 约束（NimBLE、iOS 配对、report 节奏）见 `m5stack_sticks3_esp_
 | 底部文字用大字体 | 超出 135 像素屏幕高度被裁剪 | 底部用 Font0，y 不超过 130 |
 | WiFi 持续连接不设 modem sleep | 整机发烫、电池快速耗尽 | `WiFi.setSleep(true)` 开启 modem sleep；loop 里用 `vTaskDelay` 替代 `delay` 让 CPU 进 idle |
 | loop 里用 delay() 忙转 | CPU 不降频，持续发热 | 用 `vTaskDelay(pdMS_TO_TICKS(10))` 替代 `delay(10)` |
+| download mode 刷写后设备留在 ROM | esptool 输出 "Hard resetting via RTS pin" 但设备仍停在 ROM：端口存在、`board list` 显示 "ESP32 Family Device"、串口完全静默 | 刷后必须用独立信号确认应用真的启动了（READY 行/网络/行为）；卡住时非物理恢复：`esptool -p <port> --chip esp32s3 --before default_reset --after hard_reset chip_id`，或短按一次 PWR |
+| 端口存在就当应用在跑 | ROM download mode 同样枚举出 CDC 端口，与正常运行态无法从 `/dev` 区分 | 以应用层信号为准（READY 行、网络 health、屏幕行为）；端口只说明芯片活着 |
+| 跨设备传绝对 `millis()` 时间戳 | 两台 `millis()` 基准独立，相减无符号下溢出上亿毫秒，倒计时/时序卡死 | 只传周期/相位内相对时间，接收端用本地收包时刻锚定（见 ESP-NOW 一节） |
+| 全屏 `fillScreen` 每秒重刷 | 整屏闪烁，SPI 带宽被 HUD 刷新吃满 | `fillScreen` 只在换色时做；数字/电量用固定区域 `fillRect` 清底后局部重绘 |
+| 数字位数变化不清底 | "20"→"9" 后残留旧位 ghost 数字 | 先 `fillRect` 按最大位数清固定区域再画；角落锚定用 `TR_DATUM`/`TL_DATUM` |
+| 关外设后怀疑电量读坏了 | `cfg.output_power = false` 后以为 `getBatteryLevel()` 失效 | 电量走 M5PM1 I2C，与 EXT 5V 输出轨开关无关，全外设关闭后电量照读 |
 
 ## 参考资源
 
