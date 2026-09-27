@@ -298,7 +298,7 @@ esp_now_register_recv_cb(recv_cb);
 
 - 收包回调签名以 IDF 5.x 为准：`void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)`；IDF 4.x 是 `(const uint8_t *mac, const uint8_t *data, int len)`，旧签名直接编不过。
 - 回调只做 memcpy 到局部 + 置 volatile 标志，状态机处理放主循环，与 IR RMT 回调的约束一致。
-- 单播必须先 `esp_now_add_peer`；peer 缺失时发送静默失败，不报错。
+- `esp_now_add_peer` 对加密单播是必需项（driver 需要查 PMK/LMK，缺失时 `esp_now_send` 显式报错）；无加密单播不注册 peer 通常也能直接发到目标 MAC。配方里显式注册是推荐做法，省略前请先实测对端可达性。
 - 两端信道不一致时帧被静默丢弃：没有 disconnect 事件、没有错误日志。排障第一步是两端各自 `esp_wifi_get_channel()` 核对。
 - **禁止跨设备传绝对 `millis()`**：每台设备的 `millis()` 以自己的开机为基准，两台之间的差是任意的（实测可达数十秒），接收端拿对端时间戳与本地相减会无符号下溢，时序/倒计时卡死。只传周期/相位内的相对时间，接收端用本地收包时刻锚定。
 - `esp_now_send()` 的返回值只表示提交给 driver，不代表对端收到；需要可靠性时应用层自己加序列号/心跳，或升级到加密单播 + 应用层认证的重型方案。
