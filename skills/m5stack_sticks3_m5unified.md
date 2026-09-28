@@ -77,20 +77,9 @@ arduino-cli upload \
 
 macOS 上设备通常显示为 `/dev/cu.usbmodem*`；数字后缀由系统动态分配，不能写死为 `101`。
 
-### Arduino 自主测试闭环
+### 自主测试闭环
 
-Arduino/M5Unified 固件也应提供与 ESP-IDF 路径相同的机器验收能力，而不是停在 `arduino-cli upload` 成功。开发构建可在 `loop()` 中读取 newline-delimited serial 命令，将逻辑事件或固定输入送入产品正在使用的函数，再返回单行结构化结果。
-
-最小契约包含：
-
-- 启动完成后输出 `READY build_id=<id> target=m5stack_sticks3`。
-- 命令携带唯一 `request_id`、测试名，以及 payload 的长度/hash。
-- 结果回显 `build_id`、`request_id`、`status`、耗时、原始测量和具体错误。
-- host runner 自动发现 `/dev/cu.usbmodem*`，拒绝不匹配的旧 `build_id`，并以 exit code 表示断言结果。
-
-按钮逻辑可抽成同时接受 `M5.BtnA`/`M5.BtnB` 事件和 test command 的函数，便于 agent 自动遍历状态机；最终仍要实按 BtnA/BtnB 验证 GPIO 和 Button_Class 行为。显示测试可以由命令切换纯色和布局，但颜色、裁切和闪烁必须在屏幕上验收。进入 light/deep sleep 前应先发送终态、`Serial.flush()`，并保留可恢复路径。
-
-需要人参与的手动测试（按键、说话等）：host 端串口日志必须**先开起来并确认在写**，再请用户操作。串口只在 port 打开期间保留数据，日志窗口与人的操作错位 = 关键数据段（如通话中的收发统计）永久丢失，只能重新刷写重来。
+Arduino/M5Unified 固件的机器验收走与 ESP-IDF 路径相同的契约：启动后输出 `READY build_id=<id> target=m5stack_sticks3`、命令带 `request_id`、结果回显结构化测量、host runner 自动发现端口并以 exit code 表示断言。完整契约（刷写闭环、刷后验收、自动化边界、需要人参与的手动测试的日志纪律）见 `m5stack_sticks3_test_loop.md`。
 
 ## 显示
 
@@ -144,6 +133,7 @@ M5.Display.drawString("Power: ON", 5, 50);
 - 每秒更新的内容（倒计时、百分比）先 `fillRect` 清一个**固定区域**（按最大位数留宽），再重绘。数字位数变化（"20"→"9"）不清底会残留旧位 ghost。
 - 角落锚定文字用 `TR_DATUM`（右上角）/ `TL_DATUM`（左上角），y 取 `height() - 20` 左右（`Font0` size 2 字形高 16px），避免超出屏边被裁。
 - 实机验证过的布局：右下角倒计时、左下角电量，均为 `Font0` size 2 黑字、1 Hz 更新；状态切换时整屏 fill 一次，持续期间只重绘角落区域，无闪烁。
+- 固定坐标画单位符号 + 位数可变的数字（如 "100%"）：数字右对齐（TR_DATUM）、单位符号固定在右缘，fillRect 区域按最大位数留宽；否则三位数时单位叠在末位数字上，糊掉误读（看着像 "10%"）。
 
 ## 按钮
 
@@ -324,6 +314,42 @@ bool rx_callback(rmt_channel_handle_t chan, const rmt_rx_done_event_data_t *edat
 - `signal_range_min_ns` 最大 3187ns（RMT 硬件限制），设太大直接报错
 - RMT RX 是 one-shot，每次接收完需重新调 `rmt_receive()`
 - 停止接收：`rmt_disable()` + `rmt_enable()`
+- 不要使用旧版 IRremote 库：不兼容 ESP32-S3 的 RMT，用 driver/rmt_tx.h / driver/rmt_rx.h。
+- RMT RX 回调返回值：只写 volatile 标志时返回 false；用 FromISR API 唤醒高优先级 task 时返回 wake 标志，不要一律写死。
+
+### NEC 协议
+
+NEC 是最常见的电视遥控器协议。一次按键发送一个 32-bit 帧：
+
+- 引导码：9ms mark + 4.5ms space
+- 32 bit 数据：每 bit = 560us mark + (560us space = 0 / 1690us space = 1)，LSB first
+- 结尾：560us mark
+- 总时长约 67ms
+
+32-bit 结构：
+- bit 0-7: 地址
+- bit 8-15: 地址反码（标准 NEC）或地址高字节（扩展 NEC）
+- bit 16-23: 命令
+- bit 24-31: 命令反码
+
+### NEC 解码校验（噪声过滤）
+
+StickS3 内置 IR 接收器对环境红外敏感。不做协议校验的固件会把环境噪声当作有效帧。有效的 NEC 校验策略：
+
+1. 引导码时间窗口：mark 8000-10000us, space 4000-5000us
+2. Repeat 帧检测：mark 8000-10000us, space 2000-3000us → 丢弃
+3. 每个 bit 的 mark 校验：300-800us
+4. 每个 bit 的 space 窗口校验：0 = 300-1000us, 1 = 1200-2200us（不要用单一阈值 `space > 1000`）
+5. 命令反码校验：`(cmd ^ cmd_inv) == 0xFF`
+6. 地址反码校验：标准 NEC 要求 `(addr ^ addr_inv) == 0xFF`；扩展 NEC 不要求（16 位地址）
+7. symbol 数量校验：NEC 帧约 34 个 RMT symbol，接受范围 33-36
+
+### IR 物理位置与距离
+
+- 收发器在设备顶部
+- Copy 时：电视遥控器对准 StickS3 顶部
+- Replay 时：StickS3 顶部对准电视
+- 有效距离约 2-3 米，需正对，不能穿墙
 
 ## 存储（NVS / Preferences）
 
