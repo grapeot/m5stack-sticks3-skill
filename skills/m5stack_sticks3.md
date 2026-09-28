@@ -2,9 +2,11 @@
 
 > 面向 AI agent 的 M5StickS3 嵌入式开发指南。覆盖硬件概览、引脚、按钮、电源、存储和已知陷阱。
 >
-> 框架特定内容在子文件：
-> - ESP-IDF：`m5stack_sticks3_esp_idf.md`（裸驱 LCD、ES8311 音频、BLE HID、实时 WebSocket）
-> - M5Unified / Arduino：`m5stack_sticks3_m5unified.md`（环境搭建、显示 API、IR RMT、按钮 API、NVS）
+> 子文件路由：
+> - 自主刷写与测试闭环（框架无关）：`m5stack_sticks3_test_loop.md`（运行态自动刷写、刷后验收、测试结果契约、自动化边界）——做固件 bring-up 或持续迭代先读这份
+> - ESP-IDF：`m5stack_sticks3_esp_idf.md`（项目配置、裸驱 LCD、ES8311 音频、BLE HID、实时 UI）
+> - M5Unified / Arduino：`m5stack_sticks3_m5unified.md`（环境搭建、显示 API、IR RMT 与 NEC、按钮 API、NVS、省电）
+> - iOS 中文输入：`docs/ios_chinese_input.md`（BLE HID Unicode 边界与 Custom Keyboard 架构）
 
 ## 元数据
 
@@ -157,92 +159,17 @@ StickS3 没有独立 BOOT 键。进入下载模式的官方流程：
 
 此时 esptool / arduino-cli 可以稳定连接。
 
+绿灯闪烁只作为进入 Download Mode 的指示，其他灯态不下应用层结论。
+
 ### 从 Download Mode 正常启动
 
 esptool 刷完后会自动发 hard reset，设备应从 flash 启动。如果因电池供电导致 reset 无效：
 - 短按一下 PWR/reset 键（单击 = 硬件复位，会从 flash 正常启动）
 - 如果短按也没用，双击 PWR 关机，再单击开机
 
-### 优先建立自主刷写闭环
+### 自主刷写与测试闭环
 
-StickS3 的原生 USB Serial/JTAG 支持从正常运行态自动进入 ROM download mode。只要应用没有关闭或重配 USB、设备没有进入会让 USB 失效的睡眠状态、主机仍能看到 CDC 端口，就应直接执行：
-
-```bash
-idf.py -p /dev/cu.usbmodemXXX -b 115200 flash
-```
-
-实机验证的稳定闭环是：
-
-```text
-正常运行态
-  → esptool 通过 USB Serial/JTAG 自动进入 download mode
-  → 115200 baud 写入并校验 image hash
-  → --after=hard_reset
-  → 新固件正常运行
-  → 通过网络 status/health 接口确认版本或测试结果
-```
-
-这应当是 agent 的默认开发循环。**不要每次刷写前都让用户长按 PWR/reset 进入下载模式。** 物理按键是恢复手段，不是正常迭代步骤。第一次 bring-up 或固件已经破坏 USB 通路时，可以请用户做一次物理恢复；设备回到正常运行态后，应立即验证并保护上述自主闭环。
-
-电池产品即使最终必须进入 deep sleep，也应在刷写或其他非 deep-sleep reset 后保留约 60 秒的不可缩短 awake 窗口，让 macOS 完成 USB Serial/JTAG 枚举并给 agent 留出验证、重刷时间。用 reset reason 区分这类启动和 GPIO deep-sleep wake：前者设置全局 `sleep_not_before`，所有较短 idle timer 都不能越过它；后者走正常产品时序。只在 UI 上延迟 60 秒不够，因为期间的按钮往返或任务完成可能重新设置更早的休眠 deadline。
-
-刷写后的验收也要避免改变被测状态。USB CDC/monitor 的打开、关闭和 DTR/RTS 操作可能再次触发 `USB_UART_CHIP_RESET`；设备本来停在 ROM download mode 时，打开 monitor 只会再次看到 `DOWNLOAD(USB/UART0)`，不能据此证明刚才的应用从未启动。优先用网络 health/status、LED 测试模式或其他独立信号确认运行。需要串口日志时，再明确把“观察应用”和“触发 reset”分开设计。
-
-#### 何时才请求用户介入
-
-先检查端口、当前网络状态和 esptool 连接结果，再决定是否需要物理操作：
-
-| 当前状态 | Agent 行为 |
-|----------|------------|
-| 应用正常运行，USB CDC 端口存在 | 直接自动刷写；不要请求按键 |
-| 刷写成功且网络 health/status 恢复 | 自主闭环成立，继续迭代 |
-| 设备已停在物理触发的 ROM download mode，刷后仍未运行 | 请求短按一次 PWR/reset；回到运行态后重新验证自动刷写 |
-| CDC 端口消失，但设备仍在网络上 | 检查 light/deep sleep、USB pin/console 配置；优先通过网络命令恢复或重启 |
-| CDC 和网络都不可达、固件 boot loop、USB 被重配 | 明确请求长按 PWR/reset 至绿灯闪烁，只做一次恢复刷写 |
-| 电源状态不明或短按无效 | 请求双击关机再单击开机，随后恢复自主闭环 |
-
-请求用户帮助时，要说明**为什么机器已经越过自主能力边界、需要做哪个动作、预期把设备送到什么状态**。用户完成后 agent 应立即继续，不把后续机器可完成的步骤再交还给用户。
-
-### 从自主刷写升级为自主实验
-
-刷写成功只证明 image 可以写入，不能证明目标功能成立。高效的 agent 开发循环应形成下面的闭环：
-
-```text
-修改源码 → clean build → flash/hash verify → 读取新 build identity
-        → 机器触发一个测试 → 设备执行真实业务路径
-        → 返回结构化结果和原始测量 → 主机断言 → 保留失败证据或继续迭代
-```
-
-固件应暴露一个最小测试控制面，可以使用 USB serial、网络或 BLE，但必须满足以下结果契约：
-
-- 启动后输出唯一的 `build_id` 或 git SHA，主机据此拒绝旧固件、旧端口和缓存响应。
-- 每条命令带 `request_id`；每次测试只有一个可关联的终态 `pass`、`fail` 或 `error`，并有明确 timeout。
-- 结果至少包含 `build_id`、`request_id`、测试名、状态、耗时、关键原始测量和错误细节。不要只输出自然语言 `OK`。
-- 测试入口调用产品固件正在使用的 preprocessing、driver、inference、storage 或 network 路径；只在边界注入可控输入，不另写一套永远成功的测试实现。
-- 固定输入记录长度/hash，随机流程记录 seed。主机应先验证输入完整性，再判断设备输出。
-- 日志明确标记 `simulator`、`host` 或 `device`。只有结果确实由 StickS3 执行时才能标记 `device`。
-- 未认证控制面不接收或回显 secret；测试结果中的地址、token 和用户数据必须脱敏。
-
-协议不必复杂。line-delimited JSON 或稳定的 key-value 行就足够，例如：
-
-```text
-READY build_id=abc123 target=esp32s3
-RESULT build_id=abc123 request_id=17 test=audio_capture status=pass elapsed_ms=1032 bytes=48000 peak=812
-```
-
-主机 runner 负责发现动态端口、等待匹配的 `READY`、发送命令、验证 `request_id` 和输入 hash、解析结果并以非零 exit code 表示断言失败。完整原始串口记录应作为失败证据保留；CLI 不要把 timeout、设备重启或底层错误压缩成笼统的 `test failed`。
-
-当完整应用无法解释故障时，优先做最小 measurement firmware，而不是继续猜。它只保留当前被测链路及其供电、时钟和输入，输出可量化的原始结果；确认基线后再逐项加回显示、网络、BLE、存储和睡眠。每次只改变一个主要变量，并保留最后一个通过的 firmware hash，便于二分回归和恢复。
-
-### 自动化边界
-
-测试控制面可以注入按钮对应的逻辑事件、固定 PCM、网络 payload 或其他确定输入，从而减少重复人工操作，但不能把注入结果冒充物理验收。以下边界仍需要真实设备或用户动作：
-
-- 首次接线、USB 控制面完全失联后的恢复，以及移动、遮挡或对准设备。
-- 按钮电气/机械行为、LCD 实际颜色与布局、扬声器声音、麦克风环境响应、IR/RF 目标响应和真实功耗。
-- deep sleep、USB 重配置或 GPIO19/GPIO20 用途会主动切断控制面时的最终场景验收。
-
-进入会切断控制面的状态前，先输出最终结构化结果并等待传输完成，同时保留定时唤醒、网络恢复命令或已知可工作的恢复 image。Agent 应把人工动作压缩到这些物理边界，而不是把整轮构建、刷写和日志判断交给用户。
+运行态直接刷写的稳定闭环、刷后验收（为什么端口存在不算证据、卡 ROM 的非物理恢复）、刷后约 60 秒 sleep 窗口、测试结果契约（build_id / request_id / READY-RESULT 协议）、host runner 与自动化边界，见 `m5stack_sticks3_test_loop.md`。物理按键是恢复手段，不是正常迭代步骤。
 
 ### 电池与电源保持
 
@@ -254,9 +181,7 @@ StickS3 不需要 MCU GPIO4 HOLD 来维持主电源。M5PM1 自身管理主电�
 
 ### ES8311 与音频
 
-ES8311 和 MEMS mic 由 `3V3_L3B_AU` 供电，不依赖 EXT_5V。ESP-IDF 裸驱初始化细节（M5PM1 LDO、`esp_codec_dev` 配置、验收方法）见 `m5stack_sticks3_esp_idf.md`。
-
-Arduino/M5Unified 用户不需要手动初始化 ES8311：`internal_mic` / `internal_spk` **默认就是 true**，`Speaker.begin()` / `Mic.begin()` 的回调（`tone()` / `record()` 也会惰性触发）完成功放使能 + ES8311 寄存器写入 + I2S 启动。出声的真正前置条件是：① `output_power` 保持默认 **true**——5V boost 给 AW8737 功放供电，关掉则喇叭完全无声（mic 不受影响）；② master volume——默认 64/255 在内置小喇叭上近乎不可闻，实测建议 ≥128；③ 板型检测正确。mic 是标准 I2S 输入（经 ES8311 ADC）走 I2S_NUM_1（data=16），speaker 是 I2S DAC 走 I2S_NUM_0（data=14，默认 22050Hz stereo），共用 bck/ws/mck 引脚，可同时采集与播放。mic/speaker 的 API、缓冲语义、流式播放与音量实测见 `m5stack_sticks3_m5unified.md` 的音频一节。如需关闭功放（IR 接收前），`cfg.internal_spk = false` + `M5.Speaker.end()`。
+ES8311 和 MEMS mic 由 `3V3_L3B_AU` 供电，不依赖 EXT_5V。ESP-IDF 裸驱初始化细节（M5PM1 LDO、`esp_codec_dev` 配置、验收方法）见 `m5stack_sticks3_esp_idf.md`；Arduino/M5Unified 的音频 API、默认配置、无声排查顺序见 `m5stack_sticks3_m5unified.md`。
 
 ### EXT_5V 输出
 
@@ -310,69 +235,24 @@ esp_now_register_recv_cb(recv_cb);
 - `esp_now_recv_info_t.rx_ctrl` 是**指针**（`wifi_pkt_rx_ctrl_t *`）：RSSI 取 `info->rx_ctrl->rssi`，点访问直接编译错误。
 - **周期包携带状态副本时，事件路径必须在两端都真的被处理**：否则周期包里的 stale 副本会按周期覆盖对端的新鲜本地状态（实例：1Hz 心跳携带按钮态，但收端没处理按钮事件包 → 本地 hold 状态每秒被 stale 0 覆盖一次，屏幕每秒闪一帧默认画面）。协议评审时逐条检查"每条事件路径在两个角色上都落地"。
 
-## 已知陷阱汇总
+## 入门陷阱速查
 
-| 陷阱 | 表现 | 应对 |
-|------|------|------|
-| 用 espressif 官方 esp32 core | 找不到 StickS3 board 定义 | 用 `m5stack:esp32` board package |
-| FQBN 写成 `m5sticks3` | 编译报 unknown board | 正确是 `m5stack_sticks3`（带前缀） |
-| sketch 放在 `src/foo.ino` | `main file missing from sketch: src/src.ino` | 放在 `src/foo/foo.ino` |
-| PlatformIO / ESP-IDF 把 PSRAM 配成 Quad/QSPI | PSRAM 初始化 panic、黑屏或 boot loop | StickS3 是 8MB Octal/OPI PSRAM；核对 `qio_opi` 或 IDF Octal PSRAM 配置 |
-| 用 PWR 键做 UI | 短按触发硬件复位，设备重启 | 只用 BtnA 和 BtnB |
-| IR RX 不关功放或未开 EXT_5V | 接收到噪声、无信号，或 IR TX/RX 完全不工作 | `cfg.internal_spk = false` + `M5.Speaker.end()` + `M5.Power.setExtOutput(true, m5::ext_none)` |
-| 用旧版 IRremote 库 | 不兼容 ESP32-S3 RMT | 用 `driver/rmt_tx.h` / `driver/rmt_rx.h` |
-| RMT RX callback 返回值一律写死 | 误报调度状态或漏掉唤醒 | 只写 volatile 标志时返回 false；用 FromISR API 唤醒高优先级 task 时返回 wake 标志 |
-| NEC 解码用单一阈值 `space > 1000` | 噪声和异常 space 被接受 | 用窗口：0 = 300-1000us, 1 = 1200-2200us |
-| NVS 多次更新相关 key | 断电时可能出现部分新值、部分旧值 | 用带版本和固定宽度字段的单 key blob，并校验长度 |
-| 拔 USB 后设备不重启 | 电池供电，拔 USB 不断电 | 双击 PWR 关机后单击开机，或短按 PWR 复位 |
-| 把 ES8311 供电误认成 BOOST 5V | ES8311 身份寄存器读取失败或 codec 未上电 | 打开 M5PM1 LDO_EN/LDO_HOLD，并将 GPIO2 `PYG2_L3B_EN` 输出高电平 |
-| 手抄部分 ES8311 寄存器 | 身份 readback 正常但 PCM 严格全零 | 使用 `esp_codec_dev_open()` + `esp_codec_dev_set_in_gain()` 完成 open/enable/gain 状态机 |
-| 误以为需要 GPIO4 HOLD | 不必要地占用 GPIO4，或误删音频 `LDO_HOLD` | 主电源不需要 GPIO4 HOLD；音频 L3B 仍需 M5PM1 `LDO_HOLD` |
-| 进入下载模式用按 BOOT 插 USB | StickS3 没有 BOOT 键，操作无效 | 连 USB 后长按侧边 PWR/reset 直到绿灯闪 |
-| 每次刷写前都要求用户长按 PWR/reset | 人为打断可自动化的开发循环，无法连续实验或二分回归 | 运行态且 CDC 端口存在时直接 `idf.py ... flash`；物理 download mode 只用于恢复 |
-| 用重新打开 serial monitor 作为刷后唯一验收 | DTR/RTS 或 USB CDC open 再次触发 reset，观察动作改变设备状态 | 刷后先用网络 health/status 或独立信号验收；串口观察与 reset 控制分开 |
-| 把 build/flash 成功当成功能验收 | image hash 正确，但新固件未启动、输入损坏或真实业务路径仍失败 | 校验新 `build_id`，再完成“命令 → device 结果 → host 断言”闭环 |
-| 测试固件另写一套简化实现 | 测试全绿，产品中的 preprocessing、driver 或 postprocessing 仍有 bug | 复用产品路径，只在输入和输出边界增加控制面与 telemetry |
-| 测试结果没有 build/request identity | 把旧端口、重启前日志或上一次响应误判为当前实验 | 每条 `READY`/`RESULT` 带 `build_id`，每个测试带唯一 `request_id` |
-| 用 host/simulator 结果代替实机结果 | 本机算法通过，但芯片量化、内存、时序或外设路径失败 | 结果标记执行层；device 验收必须由 StickS3 运行并回传原始测量 |
-| 结果发完前进入 deep sleep | 主机 timeout，无法区分测试失败、日志未 flush 和 USB 消失 | 发送终态并等待传输完成后再睡眠；保留定时唤醒或恢复 image |
-| 生产固件刷写后立即 deep sleep | macOS 尚未重新枚举 USB，CDC 端口消失，后续自动验证和重刷失去窗口 | 非 deep-sleep reset 后设置不可被短 idle timer 缩短的约 60 秒 `sleep_not_before`；GPIO 唤醒仍走正常产品时序 |
-| 把绿灯状态当成应用诊断 | 闪烁时误判崩溃，或从其他灯态推断应用正常 | 只把绿灯闪烁解释为 Download Mode；其他灯态不下结论 |
-| 端口运行时消失 | 固件未启用 CDC、boot loop、低功耗或动态端口变化 | 先检查 CDC-on-boot 和串口日志；无法恢复时连接 USB，长按 PWR/reset 直到绿灯闪烁 |
-| BLE HID 延时小于一个 FreeRTOS tick | 文字约 17 字符后截断，NimBLE 报 `Unable to fetch protocol_mode` | 检查 `CONFIG_FREERTOS_HZ`；100Hz 时 `pdMS_TO_TICKS(5)` 为 0。40 个 msys buffer 配合返回值检查和有界重试时，10ms 已通过连续 95 字符实机测试 |
-| NimBLE host buffer 全放 internal RAM，同时运行 TLS | TLS connect 或大 body write 失败，`esp_http_client_write()` 可能返回 0 且 socket errno 仍为 0，看起来像 MTU、ACK 或 Wi-Fi 故障 | StickS3 有 8MB PSRAM 时优先 `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`；在 BLE 已初始化/已连接状态用超过旧失败边界的 HTTPS request 做 A/B 验收 |
-| 每个 BLE HID key 都发送 press + release | 打字速度只有必要 report 数量的一半 | 不同 key 可直接用下一份状态 report 替换，自动释放旧 key；相同连续 key 必须先发空 report，字符串结尾必须 release |
-| 看到 BGR 配置后又手动交换 RGB565 红蓝位 | 纯蓝显示红褐色或紫色，palette 无法直觉调整 | StickS3 实机 framebuffer 使用标准 RGB565；先用纯色块单独验证 element order |
-| 凭相近 ST7789 板型猜 panel 参数 | offset 对了但 inversion/order 错，反复调色仍不稳定 | 直接查 M5GFX `board_M5StickS3`：RGB order、`invert=true`、offset `(52,40)` |
-| RGB565 framebuffer 未声明 little endian | 深蓝 `0x0009` 显示草绿，蓝色 `0x00DF` 显示黄色 | `esp_lcd_panel_dev_config_t.data_endian = LCD_RGB_DATA_ENDIAN_LITTLE` |
-| `draw_bitmap` 返回后立刻复用或释放 buffer | 图形大致正确但颜色随机，深色 banner 变黄、浅色文字变红 | `on_color_trans_done` 发 semaphore；DMA 完成后才能改写栈/static buffer 或 `free()` heap buffer |
-| StickS3 ST7789P3 未开启 color inversion | 白色显示黑色、深色显示浅色，怎么调 palette 都不对 | panel init 后调用 `esp_lcd_panel_invert_color(panel, true)`，再检查 BGR/endian |
-| 音量条每个 audio chunk 多次清屏/填色 | meter 闪烁，按钮和录音链路变迟钝 | 音频先入队；静态 framebuffer 一次合成、一次 DMA，LCD 限制约 10fps |
-| drawHeader 不设字体 | 继承前一个屏幕的字体，显示异常 | 封装函数内显式 setFont |
-| 底部文字用大字体 | 超出 135 像素屏幕高度被裁剪 | 底部用 Font0，y 不超过 130 |
-| WiFi 持续连接不设 modem sleep | 整机发烫、电池快速耗尽 | `WiFi.setSleep(true)` 开启 modem sleep；loop 里用 `vTaskDelay` 替代 `delay` 让 CPU 进 idle |
-| loop 里用 delay() 忙转 | CPU 不降频，持续发热 | 用 `vTaskDelay(pdMS_TO_TICKS(10))` 替代 `delay(10)` |
-| download mode 刷写后设备留在 ROM | esptool 输出 "Hard resetting via RTS pin" 但设备仍停在 ROM：端口存在、`board list` 显示 "ESP32 Family Device"、串口完全静默 | 刷后必须用独立信号确认应用真的启动了（READY 行/网络/行为）；卡住时非物理恢复：`esptool -p <port> --chip esp32s3 --before default_reset --after hard_reset chip_id`，或短按一次 PWR |
-| 端口存在就当应用在跑 | ROM download mode 同样枚举出 CDC 端口，与正常运行态无法从 `/dev` 区分 | 以应用层信号为准（READY 行、网络 health、屏幕行为）；端口只说明芯片活着 |
-| 跨设备传绝对 `millis()` 时间戳 | 两台 `millis()` 基准独立，相减无符号下溢出上亿毫秒，倒计时/时序卡死 | 只传周期/相位内相对时间，接收端用本地收包时刻锚定（见 ESP-NOW 一节） |
-| 全屏 `fillScreen` 每秒重刷 | 整屏闪烁，SPI 带宽被 HUD 刷新吃满 | `fillScreen` 只在换色时做；数字/电量用固定区域 `fillRect` 清底后局部重绘 |
-| 数字位数变化不清底 | "20"→"9" 后残留旧位 ghost 数字 | 先 `fillRect` 按最大位数清固定区域再画；角落锚定用 `TR_DATUM`/`TL_DATUM` |
-| 关外设后怀疑电量读坏了 | `cfg.output_power = false` 后以为 `getBatteryLevel()` 失效 | 电量走 M5PM1 I2C，与 EXT 5V 输出轨开关无关，全外设关闭后电量照读 |
-| 喇叭无声先怀疑"忘了开 audio" / 音量没设 | 排查方向跑偏 | `internal_spk/internal_mic` 默认就是 true，裸 `M5.begin()` 官方例子即可发声；无声要按 M5Unified 子 skill 的使能链排查顺序走（版本 A/B → 库路径/板型 → PMIC 0x11 bit3 与 ES8311 寄存器 ACK/回读 → I2S 信号流）；master volume 默认 64/255 也常被忽略 |
-| 连续 `playRaw` 用 `channel=-1` 自动选声道 | 播 8 帧左右后突然没声 | 虚拟声道只有 8 个，短 chunk 各占一个，占满后 `playRaw` 失败；连续流式必须固定 `channel=0` 并 `stop(0)` 复位 |
-| `M5.Mic.record(buf, n)` 当成"阻塞到本 buf 填满" | 处理到的永远是上一帧或空 buffer，节拍错乱 | 双缓冲 flip 语义：本次调用阻塞到**上一次**请求完成才返回；处理的是上一次 `record` 的 buf（滞后一帧），阻塞本身即 ~20ms 节拍器 |
-| `info->rx_ctrl.rssi` 点访问 | 编译错误（`rx_ctrl` 是指针类型） | `info->rx_ctrl->rssi`（`wifi_pkt_rx_ctrl_t *`） |
-| 凭记忆手抄 G.711 μ-law 编解码 | 声音全糊或编解码互相不认（μ-law 是 sign(1)+seg(3)+quant(**4** bit)，每段 16 级，不是 3-bit mantissa） | 用参考实现（Python `audioop`）生成解码 LUT + 128 级正幅值表（编码=查表取最近档）；注意 `audioop.ulaw2lin(data, w)` 的 `w` 是**输出**宽度，16bit 要传 2，传 1 会静默返回 ±255 截断的 8bit，核对码本时全盘皆错 |
-| 周期包（心跳/相位包）携带状态副本，事件路径只在一端实现 | 对端新鲜本地状态被 stale 副本按周期覆盖，表现为周期性单帧闪烁/状态回跳 | 协议评审逐条核对每条事件路径在两个角色上都被处理（实例：ESP-NOW 按钮联动，controller 不处理 BTN 包 → 相位包里的 stale 按钮态每秒覆盖 follower 的 hold 态） |
-| 固定坐标画单位符号 + 位数可变的数字（如 "100%"） | 三位数时单位叠在末位数字上，糊掉误读（看着像 "10%"） | 数字右对齐（`TR_DATUM`）、单位符号固定在右缘，`fillRect` 区域按最大位数留宽 |
-| 人机交互测试的串口监听窗口与实际操作没对齐 | 关键数据段（如通话中的收发统计）全部丢失，无法定位是发端还是收端的问题 | host 端日志先开、确认在跑，再让用户操作；串口只在 port 打开期间保留数据，窗口错过即永久丢失 |
-| 把相邻板型的音频回调当成 StickS3 的（M5StopWatch 的 G3/G10 + 0xEF 序列） | 手动重放"看似正确"的使能序列仍无声，白烧一轮调试 | StickS3 功放 = M5PM1（0x6E）寄存器 0x11 bit3，DAC 音量 0x32=0xBF；重放前先核对回调函数名（`_speaker_enabled_cb_sticks3`）与所在板型 case 块 |
-| 用 `in_i2c_bulk_write` 同款方式手配 codec 寄存器后假设"写过了" | 写失败被静默吞掉，"执行了" ≠ "到达芯片了" | 用公共 API 拿逐寄存器 ACK + 回读：`M5.In_I2C.writeRegister8/bitOn/readRegister8`；注意 mic 回调走临时 switcher（bus 1/47/48）、speaker 回调走默认 In_I2C，两条通路不等价 |
-| 喇叭完全无声（连官方零配置例子都无声）先怀疑硬件 | 两台同无声 = 大概率共同软件原因（库版本/使能链），换硬件前浪费预算 | 先 `arduino-cli lib list` 查 M5Unified/M5GFX 版本并做升级 A/B；"无声" ≠ 功放坏，常见是 ES8311 DAC 未上电（0x12）/PMIC bit3 未置位/I2S TX 未起 |
-| 串口监听与刷写同窗口进行 | `arduino-cli upload` 失败（esptool 连接错误 exit 2），pyserial 报 "multiple access on port"，开机日志丢失 | 先刷写、后开监听；或把诊断块放 `loop()` 每几秒重跑，不依赖开机时序 |
-| 照抄 M5Stack 官方文档例子里的显示 API | 编译错误（`TOPLEFT`/`Display.update()` 未声明） | 旧 M5GFX API；现版本用 `TL_DATUM`/`TR_DATUM` + `startWrite()`/`endWrite()` |
-| 省电思路设 `cfg.output_power = false` | 喇叭完全无声（音量 200 也无声），而 mic 正常、其余全正常，很难猜到是电源轨 | 5V boost（EXT_5V）给 AW8737 功放供电：需要喇叭就保持默认 `output_power = true`；mic/ES8311 在 3V3 音频轨，不受该开关影响 |
-| 用 `tone()` 或默认音量判断"喇叭有没有声/最大声量" | 默认音量 64/255 在 1W 小喇叭上近乎不可闻，`tone()` 又是库内置低幅度 wav，容易误判成无声/功放坏 | 用 `playRaw` 满幅正弦（幅度 ~12000）+ `setVolume(255)` 做上限测量；内置 8Ω 1W 小喇叭物理上限就低，满幅也只到"可闻"级，产品要响直接上外接喇叭 |
+新 agent 首次开发最容易撞上、撞上一次代价高的坑。细节只在归属章节出现一次，这里只做索引。
+
+| # | 陷阱 | 指针 |
+|---|------|------|
+| 1 | 用 espressif 官方 esp32 core 找不到 StickS3 板型 | m5unified §开发环境搭建 |
+| 2 | FQBN 写成 `m5sticks3` | m5unified §FQBN |
+| 3 | PSRAM 配成 Quad/QSPI → boot loop | esp_idf §项目配置 |
+| 4 | 用 PWR 键做 UI → 短按就是硬件复位 | 本文 §按钮系统 |
+| 5 | 没有 BOOT 键，进 download mode 靠长按 PWR | 本文 §电源与启动 |
+| 6 | 每次刷写都要求用户长按 PWR/reset | test_loop §自主刷写闭环 |
+| 7 | 刷后设备停在 ROM / 端口存在当应用在跑 | test_loop §刷后验收 |
+| 8 | 把 build/flash 成功当功能验收 | test_loop §测试结果契约 |
+| 9 | 喇叭无声先怀疑硬件或音量 | m5unified §无声排查顺序 |
+| 10 | `output_power=false` 饿死功放，喇叭完全无声 | m5unified §音量与实测响度 |
+| 11 | IR 接收前不关功放、不开 EXT_5V | m5unified §IR |
+| 12 | 跨设备传绝对 `millis()` 时间戳 | 本文 §ESP-NOW |
 
 ## 参考资源
 
