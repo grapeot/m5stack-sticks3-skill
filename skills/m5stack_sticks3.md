@@ -358,7 +358,7 @@ esp_now_register_recv_cb(recv_cb);
 | 全屏 `fillScreen` 每秒重刷 | 整屏闪烁，SPI 带宽被 HUD 刷新吃满 | `fillScreen` 只在换色时做；数字/电量用固定区域 `fillRect` 清底后局部重绘 |
 | 数字位数变化不清底 | "20"→"9" 后残留旧位 ghost 数字 | 先 `fillRect` 按最大位数清固定区域再画；角落锚定用 `TR_DATUM`/`TL_DATUM` |
 | 关外设后怀疑电量读坏了 | `cfg.output_power = false` 后以为 `getBatteryLevel()` 失效 | 电量走 M5PM1 I2C，与 EXT 5V 输出轨开关无关，全外设关闭后电量照读 |
-| 只置 `internal_spk` 默认值就想出声 / 以为 `M5.begin()` 默认带音频 | 喇叭完全无声，代码"看起来"在播 | 必须显式 `cfg.internal_spk = true`（mic 同理）M5Unified 才会写 ES8311 寄存器并起 I2S；另注意 master volume 默认 64/255 |
+| 喇叭无声先怀疑"忘了开 audio" / 音量没设 | 排查方向跑偏 | `internal_spk/internal_mic` 默认就是 true，裸 `M5.begin()` 官方例子即可发声；无声要按 M5Unified 子 skill 的使能链排查顺序走（版本 A/B → 库路径/板型 → PMIC 0x11 bit3 与 ES8311 寄存器 ACK/回读 → I2S 信号流）；master volume 默认 64/255 也常被忽略 |
 | 连续 `playRaw` 用 `channel=-1` 自动选声道 | 播 8 帧左右后突然没声 | 虚拟声道只有 8 个，短 chunk 各占一个，占满后 `playRaw` 失败；连续流式必须固定 `channel=0` 并 `stop(0)` 复位 |
 | `M5.Mic.record(buf, n)` 当成"阻塞到本 buf 填满" | 处理到的永远是上一帧或空 buffer，节拍错乱 | 双缓冲 flip 语义：本次调用阻塞到**上一次**请求完成才返回；处理的是上一次 `record` 的 buf（滞后一帧），阻塞本身即 ~20ms 节拍器 |
 | `info->rx_ctrl.rssi` 点访问 | 编译错误（`rx_ctrl` 是指针类型） | `info->rx_ctrl->rssi`（`wifi_pkt_rx_ctrl_t *`） |
@@ -366,6 +366,11 @@ esp_now_register_recv_cb(recv_cb);
 | 周期包（心跳/相位包）携带状态副本，事件路径只在一端实现 | 对端新鲜本地状态被 stale 副本按周期覆盖，表现为周期性单帧闪烁/状态回跳 | 协议评审逐条核对每条事件路径在两个角色上都被处理（实例：ESP-NOW 按钮联动，controller 不处理 BTN 包 → 相位包里的 stale 按钮态每秒覆盖 follower 的 hold 态） |
 | 固定坐标画单位符号 + 位数可变的数字（如 "100%"） | 三位数时单位叠在末位数字上，糊掉误读（看着像 "10%"） | 数字右对齐（`TR_DATUM`）、单位符号固定在右缘，`fillRect` 区域按最大位数留宽 |
 | 人机交互测试的串口监听窗口与实际操作没对齐 | 关键数据段（如通话中的收发统计）全部丢失，无法定位是发端还是收端的问题 | host 端日志先开、确认在跑，再让用户操作；串口只在 port 打开期间保留数据，窗口错过即永久丢失 |
+| 把相邻板型的音频回调当成 StickS3 的（M5StopWatch 的 G3/G10 + 0xEF 序列） | 手动重放"看似正确"的使能序列仍无声，白烧一轮调试 | StickS3 功放 = M5PM1（0x6E）寄存器 0x11 bit3，DAC 音量 0x32=0xBF；重放前先核对回调函数名（`_speaker_enabled_cb_sticks3`）与所在板型 case 块 |
+| 用 `in_i2c_bulk_write` 同款方式手配 codec 寄存器后假设"写过了" | 写失败被静默吞掉，"执行了" ≠ "到达芯片了" | 用公共 API 拿逐寄存器 ACK + 回读：`M5.In_I2C.writeRegister8/bitOn/readRegister8`；注意 mic 回调走临时 switcher（bus 1/47/48）、speaker 回调走默认 In_I2C，两条通路不等价 |
+| 喇叭完全无声（连官方零配置例子都无声）先怀疑硬件 | 两台同无声 = 大概率共同软件原因（库版本/使能链），换硬件前浪费预算 | 先 `arduino-cli lib list` 查 M5Unified/M5GFX 版本并做升级 A/B；"无声" ≠ 功放坏，常见是 ES8311 DAC 未上电（0x12）/PMIC bit3 未置位/I2S TX 未起 |
+| 串口监听与刷写同窗口进行 | `arduino-cli upload` 失败（esptool 连接错误 exit 2），pyserial 报 "multiple access on port"，开机日志丢失 | 先刷写、后开监听；或把诊断块放 `loop()` 每几秒重跑，不依赖开机时序 |
+| 照抄 M5Stack 官方文档例子里的显示 API | 编译错误（`TOPLEFT`/`Display.update()` 未声明） | 旧 M5GFX API；现版本用 `TL_DATUM`/`TR_DATUM` + `startWrite()`/`endWrite()` |
 
 ## 参考资源
 

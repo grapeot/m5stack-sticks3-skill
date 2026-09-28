@@ -174,7 +174,7 @@ if (M5.BtnA.wasDoubleClicked()) {
 
 ## 音频（M5.Mic / M5.Speaker）
 
-StickS3 音频 = ES8311 codec（I2C 0x18）+ MEMS mic（PDM）。M5Unified 在 `cfg.internal_mic/internal_spk = true` 时自动完成 ES8311 寄存器配置，不需要手抄：
+StickS3 音频 = ES8311 codec（I2C 0x18）+ MEMS mic。M5Unified 自动完成功放使能与 ES8311 寄存器配置，不需要手抄（`internal_mic/internal_spk` **默认就是 true**，裸 `M5.begin()` 即就绪；显式置 true 只是保险）：
 
 ```cpp
 auto cfg = M5.config();
@@ -186,9 +186,34 @@ M5.Speaker.begin();
 M5.Speaker.setVolume(200);  // master volume 0-255，默认 64（~25%），语音应用偏低
 ```
 
-- mic：PDM 输入 **I2S_NUM_1**（data=GPIO16，bck=17，ws=15，mck=18），默认 16kHz，背景 `mic_task`（priority 2）
-- speaker：I2S DAC **I2S_NUM_0**（data=GPIO14，bck/ws/mck 与 mic 共用），板型默认 **22050Hz stereo**，背景 `spk_task`（priority 2）做播放与重采样
+- mic：标准 I2S（经 ES8311 ADC）输入 **I2S_NUM_1**（data=GPIO16，bck=17，ws=15，mck=18），默认 16kHz，背景 `mic_task`（priority 2）
+- speaker：I2S DAC **I2S_NUM_0**（data=GPIO14，bck/ws/mck 与 mic 共用同一组脚），板型默认 **22050Hz stereo**，背景 `spk_task`（priority 2）做播放与重采样
 - 两路 I2S 独立，可同时采集 + 播放（对讲机/loopback 场景）
+
+### 喇叭使能链（源码事实，"无声"排查必知）
+
+`M5.Speaker.begin()` 触发 `_speaker_enabled_cb_sticks3` 回调（以 `pin_bck==GPIO17` 为门），做两件事：
+
+1. **功放/音频电路上电**：`In_I2C.bitOn(0x6E, 0x11, 0b00001000)` —— **M5PM1 PMIC（I2C 0x6E）寄存器 0x11 的 bit3**。不是 M5IOE1 IO 扩展器的 G3/G10——那是 **M5StopWatch** 的回调（其 DAC 音量还写成 0xEF）。读源码时极易把相邻板型的回调当成 StickS3 的，手动重放"错的序列"会白烧一轮调试。
+2. **ES8311 DAC 配置**（I2C 0x18）：`0x00=0x80`（CSM 上电）、`0x01=0xB5`（MCLK=BCLK）、`0x02=0x18`、`0x0D=0x01`（模拟上电）、`0x12=0x00`（**DAC 上电**）、`0x13=0x10`（输出驱动）、`0x32=0xBF`（DAC 音量 0dB）、`0x37=0x08`（EQ bypass）。
+
+mic 回调与 speaker 回调走**不同的 I2C 通路**：mic 用 `i2c_temporary_switcher_t(1, GPIO47, GPIO48)` 临时切总线再写 ES8311 ADC 寄存器；speaker 直接写默认 `M5.In_I2C`。所以"麦克风正常"≠"speaker 的 I2C 写到达了 ES8311"，也不能反推默认 In_I2C 的端口状态没问题。
+
+回调内部的 `in_i2c_bulk_write` **写失败会被静默吞掉**（只重试、不向上返回，回调照样返回 true）。手动重放使能序列时用公共 API 拿逐寄存器 ACK + 回读：
+
+```cpp
+bool ok1 = M5.In_I2C.bitOn(0x6E, 0x11, 0b00001000, 100000);   // 功放/音频电源
+bool ok2 = M5.In_I2C.writeRegister8(0x18, 0x12, 0x00, 100000); // DAC 上电
+uint8_t rb = M5.In_I2C.readRegister8(0x18, 0x32, 100000);      // 回读确认
+```
+
+**无声排查顺序**（从便宜到贵）：
+1. `arduino-cli lib list` 确认 M5Unified/M5GFX 版本。0.2.19→0.2.23 之间有大量音频修复：0.2.20 修 I2S HW v2（ESP32-S3 等）16-bit PCM 样本顺序、BCK 分频范围、I2S 生命周期加固、Speaker 请求交接竞态；0.2.21 IOExpander 接口源码不兼容；0.2.22 I2C_Class 改用 `driver/i2c_master.h`；0.2.23 Speaker 请求锁。音频顽疾先做"升级到最新（M5GFX 需同步 0.2.30）"的受控 A/B，保留旧版可回退。
+2. 编译日志 `Using library` 行确认实际用的库路径（排除旧副本），运行时打印 `M5.getBoard()` 确认板型。
+3. 按上面的公共 API 拿 PMIC 0x11 bit3 前后值 + ES8311 逐寄存器 ACK/回读，区分"I2C 没到芯片" vs "寄存器到位但 I2S/模拟链问题"。
+4. 仍无声再往信号流下游挖：I2S0 的时钟/数据脚（GPIO18/17/15/14）有无输出、"只播音"与"播音+同时录麦"A/B（两路 I2S 共时钟脚，排除重配冲突）、AW8737 EN/供电。
+5. 交互测试技巧：诊断块放 `loop()` 每几秒重跑（使能+回读+tone），不依赖开机日志对齐；开机/循环放 `tone()` 自测音，听的人只管"听一会儿报有无"。刷写与串口监听不要同窗口：监听占着 port 时 `arduino-cli upload` 会失败（esptool 连接错误），pyserial 报 "multiple access on port"——先刷后监听。
+6. M5Stack 官方文档例子用旧 M5GFX API（`TOPLEFT`/`Display.update()`），现版本要 `TL_DATUM`/`startWrite()`/`endWrite()`。
 
 ### M5.Mic — flip-buffer 语义（易错点）
 
