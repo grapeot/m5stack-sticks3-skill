@@ -256,7 +256,7 @@ StickS3 不需要 MCU GPIO4 HOLD 来维持主电源。M5PM1 自身管理主电�
 
 ES8311 和 MEMS mic 由 `3V3_L3B_AU` 供电，不依赖 EXT_5V。ESP-IDF 裸驱初始化细节（M5PM1 LDO、`esp_codec_dev` 配置、验收方法）见 `m5stack_sticks3_esp_idf.md`。
 
-Arduino/M5Unified 用户不需要手动初始化 ES8311——但必须在 `M5.begin(cfg)` 前显式置 `cfg.internal_mic = true` / `cfg.internal_spk = true`，M5Unified 才会写 ES8311 寄存器（I2C 批量：上电、MCLK=BCLK、mic PGA/ADC 增益、DAC 0dB）并起 I2S。默认两者都是关的；只开功放配置不打开 `internal_spk` 时喇叭无声。mic 是 PDM 输入走 I2S_NUM_1（data=16），speaker 是 I2S DAC 走 I2S_NUM_0（data=14，默认 22050Hz stereo），共用 bck/ws/mck 引脚，可同时采集与播放。mic/speaker 的 API、缓冲语义与流式播放踩坑见 `m5stack_sticks3_m5unified.md` 的音频一节。如需关闭功放（IR 接收前），`cfg.internal_spk = false` + `M5.Speaker.end()`。
+Arduino/M5Unified 用户不需要手动初始化 ES8311：`internal_mic` / `internal_spk` **默认就是 true**，`Speaker.begin()` / `Mic.begin()` 的回调（`tone()` / `record()` 也会惰性触发）完成功放使能 + ES8311 寄存器写入 + I2S 启动。出声的真正前置条件是：① `output_power` 保持默认 **true**——5V boost 给 AW8737 功放供电，关掉则喇叭完全无声（mic 不受影响）；② master volume——默认 64/255 在内置小喇叭上近乎不可闻，实测建议 ≥128；③ 板型检测正确。mic 是标准 I2S 输入（经 ES8311 ADC）走 I2S_NUM_1（data=16），speaker 是 I2S DAC 走 I2S_NUM_0（data=14，默认 22050Hz stereo），共用 bck/ws/mck 引脚，可同时采集与播放。mic/speaker 的 API、缓冲语义、流式播放与音量实测见 `m5stack_sticks3_m5unified.md` 的音频一节。如需关闭功放（IR 接收前），`cfg.internal_spk = false` + `M5.Speaker.end()`。
 
 ### EXT_5V 输出
 
@@ -264,7 +264,7 @@ Arduino/M5Unified 用户不需要手动初始化 ES8311——但必须在 `M5.be
 M5.Power.setExtOutput(true, m5::ext_none);
 ```
 
-该轨用于 Grove、Hat 和 IR，不给 ES8311 或 MEMS mic 供电。
+该轨用于 Grove、Hat、IR，以及 **AW8737 喇叭功放**：`output_power = false` 时功放断电，喇叭完全无声（麦克风不受影响，它在 3V3 音频轨上）——音频场景保持默认 true。该轨不给 ES8311 或 MEMS mic 供电。
 
 ## 显示
 
@@ -371,6 +371,8 @@ esp_now_register_recv_cb(recv_cb);
 | 喇叭完全无声（连官方零配置例子都无声）先怀疑硬件 | 两台同无声 = 大概率共同软件原因（库版本/使能链），换硬件前浪费预算 | 先 `arduino-cli lib list` 查 M5Unified/M5GFX 版本并做升级 A/B；"无声" ≠ 功放坏，常见是 ES8311 DAC 未上电（0x12）/PMIC bit3 未置位/I2S TX 未起 |
 | 串口监听与刷写同窗口进行 | `arduino-cli upload` 失败（esptool 连接错误 exit 2），pyserial 报 "multiple access on port"，开机日志丢失 | 先刷写、后开监听；或把诊断块放 `loop()` 每几秒重跑，不依赖开机时序 |
 | 照抄 M5Stack 官方文档例子里的显示 API | 编译错误（`TOPLEFT`/`Display.update()` 未声明） | 旧 M5GFX API；现版本用 `TL_DATUM`/`TR_DATUM` + `startWrite()`/`endWrite()` |
+| 省电思路设 `cfg.output_power = false` | 喇叭完全无声（音量 200 也无声），而 mic 正常、其余全正常，很难猜到是电源轨 | 5V boost（EXT_5V）给 AW8737 功放供电：需要喇叭就保持默认 `output_power = true`；mic/ES8311 在 3V3 音频轨，不受该开关影响 |
+| 用 `tone()` 或默认音量判断"喇叭有没有声/最大声量" | 默认音量 64/255 在 1W 小喇叭上近乎不可闻，`tone()` 又是库内置低幅度 wav，容易误判成无声/功放坏 | 用 `playRaw` 满幅正弦（幅度 ~12000）+ `setVolume(255)` 做上限测量；内置 8Ω 1W 小喇叭物理上限就低，满幅也只到"可闻"级，产品要响直接上外接喇叭 |
 
 ## 参考资源
 

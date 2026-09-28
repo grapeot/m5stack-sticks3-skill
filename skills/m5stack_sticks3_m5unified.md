@@ -215,6 +215,12 @@ uint8_t rb = M5.In_I2C.readRegister8(0x18, 0x32, 100000);      // 回读确认
 5. 交互测试技巧：诊断块放 `loop()` 每几秒重跑（使能+回读+tone），不依赖开机日志对齐；开机/循环放 `tone()` 自测音，听的人只管"听一会儿报有无"。刷写与串口监听不要同窗口：监听占着 port 时 `arduino-cli upload` 会失败（esptool 连接错误），pyserial 报 "multiple access on port"——先刷后监听。
 6. M5Stack 官方文档例子用旧 M5GFX API（`TOPLEFT`/`Display.update()`），现版本要 `TL_DATUM`/`startWrite()`/`endWrite()`。
 
+### 音量与实测响度
+
+**无声根因（实锤）**：`cfg.output_power = false` 关掉 5V boost → AW8737 功放断电 → 喇叭完全无声，而 mic 正常（3V3 音频轨）。对照实验：`output_power` 默认 true 时官方零配置例子（补 `setVolume(128)`）即可发声；使能链本身（PMIC 0x11 bit3 + ES8311 寄存器）ACK/回读全部正常。
+
+实测响度（M5Unified 0.2.19 + core 3.3.8，USB 供电）：master volume 默认 **64/255 ≈ 不可闻**；128/255 可闻但小；255/255 仍 modest——内置是 8Ω 1W 小喇叭（单声道），物理上限低：`playRaw` 满幅（~12000）1kHz 正弦也只有"勉强可闻"级。`tone()` 用库内置 `_default_tone_wav`（低幅度），**不是**上限测量，测上限用 `playRaw` 满幅正弦 + `setVolume(255)`。要更多增益可把 ES8311 `0x32` 从 0xBF（0dB）提到 0xEF（约 +7.5dB，M5StopWatch 用的值）；产品级响度需求直接上外接喇叭。
+
 ### M5.Mic — flip-buffer 语义（易错点）
 
 `M5.Mic.record(int16_t* buf, size_t n)` **不是**"阻塞到本 buf 填满"。内部是双缓冲：本次调用**阻塞到上一次请求完成**，然后对新的 buf 发起采集并返回。即 `record()` 返回后可处理的是**上一次调用**请求的 buffer（滞后一帧）：
