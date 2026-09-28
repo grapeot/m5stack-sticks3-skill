@@ -45,6 +45,8 @@ M5StickS3 和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。本
 
 例如 M5GFX 的 StickS3 分支明确给出：`Panel_ST7789`、135x240、offset `(52,40)`、`invert=true`、默认 RGB element order、40MHz write clock、CS=41、RST=21、MOSI=39、SCLK=40、DC=45。若一开始逐项照抄这些事实，就不需要在 RGB/BGR 和 inversion 之间反复猜测。只有源码与实机仍不一致时，才做最小化纯色/引脚实验，并把差异记录下来。
 
+M5Unified 的 API 语义（`Mic_Class`/`Speaker_Class` 的缓冲与节拍、ES8311 寄存器写入时机、board 引脚映射）以本机安装的版本源码为准：sketchbook libraries 目录（macOS 通常 `~/Documents/Arduino/libraries/M5Unified`，`src/utility/` 下是各外设类）；arduino-cli 的 core 安装位置以 `arduino-cli config dump` 的 `data_dir` 为准（macOS 上可能是 `~/Library/Arduino15` 而非默认的 `~/.arduino15`，找不到 core 时先查这里）。写音频/多机协议代码前先读对应类源码确认语义，不要凭 API 名字猜。
+
 ## 硬件概览
 
 ### 芯片与外设
@@ -248,11 +250,13 @@ StickS3 内置 250mAh 电池。**拔插 USB 不会强制重启设备**（电池�
 
 StickS3 不需要 MCU GPIO4 HOLD 来维持主电源。M5PM1 自身管理主电源保持，M5Unified 的 `power_hold` pin 表也不包含 StickS3。这里不要与音频轨的 M5PM1 `LDO_HOLD` 位混淆：后者仍需在纯 ESP-IDF 音频初始化中设置。如果需要软件关机，通过 M5PM1 I2C 命令实现，而不是拉低 GPIO4。
 
+`M5.Power.getBatteryLevel()` 是**即时电池电压 → 百分比的映射（M5PM1），不是库仑计**：USB 供电（充电维持）时读数偏高，改电池带载运行（屏 + WiFi + 音频）后电压 sag，读数明显下降。实例：USB 下稳定 42-47%，拔电后立刻 10%——这是"电池快没电/内阻大"的真实反映，不是读取错误，不要当 bug 修。
+
 ### ES8311 与音频
 
 ES8311 和 MEMS mic 由 `3V3_L3B_AU` 供电，不依赖 EXT_5V。ESP-IDF 裸驱初始化细节（M5PM1 LDO、`esp_codec_dev` 配置、验收方法）见 `m5stack_sticks3_esp_idf.md`。
 
-Arduino/M5Unified 用户不需要手动初始化 ES8311——`M5.begin()` 会自动配置。如需关闭功放（IR 接收前），调 `M5.Speaker.end()`。
+Arduino/M5Unified 用户不需要手动初始化 ES8311——但必须在 `M5.begin(cfg)` 前显式置 `cfg.internal_mic = true` / `cfg.internal_spk = true`，M5Unified 才会写 ES8311 寄存器（I2C 批量：上电、MCLK=BCLK、mic PGA/ADC 增益、DAC 0dB）并起 I2S。默认两者都是关的；只开功放配置不打开 `internal_spk` 时喇叭无声。mic 是 PDM 输入走 I2S_NUM_1（data=16），speaker 是 I2S DAC 走 I2S_NUM_0（data=14，默认 22050Hz stereo），共用 bck/ws/mck 引脚，可同时采集与播放。mic/speaker 的 API、缓冲语义与流式播放踩坑见 `m5stack_sticks3_m5unified.md` 的音频一节。如需关闭功放（IR 接收前），`cfg.internal_spk = false` + `M5.Speaker.end()`。
 
 ### EXT_5V 输出
 
@@ -302,6 +306,9 @@ esp_now_register_recv_cb(recv_cb);
 - 两端信道不一致时帧被静默丢弃：没有 disconnect 事件、没有错误日志。排障第一步是两端各自 `esp_wifi_get_channel()` 核对。
 - **禁止跨设备传绝对 `millis()`**：每台设备的 `millis()` 以自己的开机为基准，两台之间的差是任意的（实测可达数十秒），接收端拿对端时间戳与本地相减会无符号下溢，时序/倒计时卡死。只传周期/相位内的相对时间，接收端用本地收包时刻锚定。
 - `esp_now_send()` 的返回值只表示提交给 driver，不代表对端收到；需要可靠性时应用层自己加序列号/心跳，或升级到加密单播 + 应用层认证的重型方案。
+- **高频数据（~50 pkt/s 音频帧等）不要在回调里只置标志**：单槽标志 + 主循环处理会在丢包率放大到不可用（loop 周期 ≥ 包间隔时旧包未处理就被新包覆盖）。回调里直接写 SPSC 环形缓冲（单生产者 = ESP-NOW 任务，单消费者 = 专用播放/处理任务，head/tail 索引无锁，满了覆盖最旧 + 计数）+ 序列号；"memcpy + 置标志"模式只留给低频控制消息。
+- `esp_now_recv_info_t.rx_ctrl` 是**指针**（`wifi_pkt_rx_ctrl_t *`）：RSSI 取 `info->rx_ctrl->rssi`，点访问直接编译错误。
+- **周期包携带状态副本时，事件路径必须在两端都真的被处理**：否则周期包里的 stale 副本会按周期覆盖对端的新鲜本地状态（实例：1Hz 心跳携带按钮态，但收端没处理按钮事件包 → 本地 hold 状态每秒被 stale 0 覆盖一次，屏幕每秒闪一帧默认画面）。协议评审时逐条检查"每条事件路径在两个角色上都落地"。
 
 ## 已知陷阱汇总
 
@@ -351,6 +358,14 @@ esp_now_register_recv_cb(recv_cb);
 | 全屏 `fillScreen` 每秒重刷 | 整屏闪烁，SPI 带宽被 HUD 刷新吃满 | `fillScreen` 只在换色时做；数字/电量用固定区域 `fillRect` 清底后局部重绘 |
 | 数字位数变化不清底 | "20"→"9" 后残留旧位 ghost 数字 | 先 `fillRect` 按最大位数清固定区域再画；角落锚定用 `TR_DATUM`/`TL_DATUM` |
 | 关外设后怀疑电量读坏了 | `cfg.output_power = false` 后以为 `getBatteryLevel()` 失效 | 电量走 M5PM1 I2C，与 EXT 5V 输出轨开关无关，全外设关闭后电量照读 |
+| 只置 `internal_spk` 默认值就想出声 / 以为 `M5.begin()` 默认带音频 | 喇叭完全无声，代码"看起来"在播 | 必须显式 `cfg.internal_spk = true`（mic 同理）M5Unified 才会写 ES8311 寄存器并起 I2S；另注意 master volume 默认 64/255 |
+| 连续 `playRaw` 用 `channel=-1` 自动选声道 | 播 8 帧左右后突然没声 | 虚拟声道只有 8 个，短 chunk 各占一个，占满后 `playRaw` 失败；连续流式必须固定 `channel=0` 并 `stop(0)` 复位 |
+| `M5.Mic.record(buf, n)` 当成"阻塞到本 buf 填满" | 处理到的永远是上一帧或空 buffer，节拍错乱 | 双缓冲 flip 语义：本次调用阻塞到**上一次**请求完成才返回；处理的是上一次 `record` 的 buf（滞后一帧），阻塞本身即 ~20ms 节拍器 |
+| `info->rx_ctrl.rssi` 点访问 | 编译错误（`rx_ctrl` 是指针类型） | `info->rx_ctrl->rssi`（`wifi_pkt_rx_ctrl_t *`） |
+| 凭记忆手抄 G.711 μ-law 编解码 | 声音全糊或编解码互相不认（μ-law 是 sign(1)+seg(3)+quant(**4** bit)，每段 16 级，不是 3-bit mantissa） | 用参考实现（Python `audioop`）生成解码 LUT + 128 级正幅值表（编码=查表取最近档）；注意 `audioop.ulaw2lin(data, w)` 的 `w` 是**输出**宽度，16bit 要传 2，传 1 会静默返回 ±255 截断的 8bit，核对码本时全盘皆错 |
+| 周期包（心跳/相位包）携带状态副本，事件路径只在一端实现 | 对端新鲜本地状态被 stale 副本按周期覆盖，表现为周期性单帧闪烁/状态回跳 | 协议评审逐条核对每条事件路径在两个角色上都被处理（实例：ESP-NOW 按钮联动，controller 不处理 BTN 包 → 相位包里的 stale 按钮态每秒覆盖 follower 的 hold 态） |
+| 固定坐标画单位符号 + 位数可变的数字（如 "100%"） | 三位数时单位叠在末位数字上，糊掉误读（看着像 "10%"） | 数字右对齐（`TR_DATUM`）、单位符号固定在右缘，`fillRect` 区域按最大位数留宽 |
+| 人机交互测试的串口监听窗口与实际操作没对齐 | 关键数据段（如通话中的收发统计）全部丢失，无法定位是发端还是收端的问题 | host 端日志先开、确认在跑，再让用户操作；串口只在 port 打开期间保留数据，窗口错过即永久丢失 |
 
 ## 参考资源
 

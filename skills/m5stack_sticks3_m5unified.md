@@ -90,6 +90,8 @@ Arduino/M5Unified 固件也应提供与 ESP-IDF 路径相同的机器验收能�
 
 按钮逻辑可抽成同时接受 `M5.BtnA`/`M5.BtnB` 事件和 test command 的函数，便于 agent 自动遍历状态机；最终仍要实按 BtnA/BtnB 验证 GPIO 和 Button_Class 行为。显示测试可以由命令切换纯色和布局，但颜色、裁切和闪烁必须在屏幕上验收。进入 light/deep sleep 前应先发送终态、`Serial.flush()`，并保留可恢复路径。
 
+需要人参与的手动测试（按键、说话等）：host 端串口日志必须**先开起来并确认在写**，再请用户操作。串口只在 port 打开期间保留数据，日志窗口与人的操作错位 = 关键数据段（如通话中的收发统计）永久丢失，只能重新刷写重来。
+
 ## 显示
 
 ### 基本用法
@@ -169,6 +171,58 @@ if (M5.BtnA.wasDoubleClicked()) {
   // 选择/确认
 }
 ```
+
+## 音频（M5.Mic / M5.Speaker）
+
+StickS3 音频 = ES8311 codec（I2C 0x18）+ MEMS mic（PDM）。M5Unified 在 `cfg.internal_mic/internal_spk = true` 时自动完成 ES8311 寄存器配置，不需要手抄：
+
+```cpp
+auto cfg = M5.config();
+cfg.internal_mic = true;   // PDM mic，I2S_NUM_1
+cfg.internal_spk = true;   // I2S DAC + 功放，I2S_NUM_0
+M5.begin(cfg);
+M5.Mic.begin();
+M5.Speaker.begin();
+M5.Speaker.setVolume(200);  // master volume 0-255，默认 64（~25%），语音应用偏低
+```
+
+- mic：PDM 输入 **I2S_NUM_1**（data=GPIO16，bck=17，ws=15，mck=18），默认 16kHz，背景 `mic_task`（priority 2）
+- speaker：I2S DAC **I2S_NUM_0**（data=GPIO14，bck/ws/mck 与 mic 共用），板型默认 **22050Hz stereo**，背景 `spk_task`（priority 2）做播放与重采样
+- 两路 I2S 独立，可同时采集 + 播放（对讲机/loopback 场景）
+
+### M5.Mic — flip-buffer 语义（易错点）
+
+`M5.Mic.record(int16_t* buf, size_t n)` **不是**"阻塞到本 buf 填满"。内部是双缓冲：本次调用**阻塞到上一次请求完成**，然后对新的 buf 发起采集并返回。即 `record()` 返回后可处理的是**上一次调用**请求的 buffer（滞后一帧）：
+
+```cpp
+static int16_t mic[2][320];   // 20ms @16k
+int prev = 0, next = 1;
+M5.Mic.record(mic[0], 320);   // seed（立即返回）
+for (;;) {
+  M5.Mic.record(mic[next], 320);  // 阻塞到 mic[prev] 填满
+  process(mic[prev]);             // 处理上一帧
+  int t = prev; prev = next; next = t;
+}
+```
+
+阻塞式 `record()` 本身就是 ~20ms 节拍器，放在专用 FreeRTOS 任务里不需要额外定时器。降速可用 `setSampleRate()`，或 16k 采集 + 隔点抽取（8k 语音够用）。
+
+### M5.Speaker — playRaw 与虚拟声道
+
+```cpp
+// 支持 int16 与 unsigned 8bit（μ-law 解码结果可直接喂），输入采样率可与输出不同
+M5.Speaker.playRaw(buf16, 160, 8000, /*stereo=*/false, /*repeat=*/1, /*channel=*/0, /*stop=*/false);
+```
+
+- **连续流式必须显式固定 `channel`（如 0）**：`channel=-1` 每次自动选空闲声道，虚拟声道共 8 个，短 chunk 各占一个，播 8 帧左右后全部占满、`playRaw` 返回 false，声音无声消失。复位用 `M5.Speaker.stop(0)`。
+- master volume 默认 **64/255**（约 25%），语音应用建议 200 左右；ES8311 DAC 硬件增益由 M5Unified 配成 0dB，音量全靠这一级数字增益。
+- 输入 8kHz 在 22050Hz I2S 上由 `spk_task` 后台重采样（`sample_rate_x256`），每 chunk 由 I2S 硬件按采样率精确播放——播放端只需保证"不超前"（chunk 间隔 ≥ 20ms，落后由缓冲吸收）。
+
+### 8kHz 语音流式配方（实机验证的起点）
+
+- 20ms/帧（160 样本 @8k），专用播放任务 `vTaskDelay(20ms)` 逐帧喂 `playRaw(channel=0)`；发送端同理 50 帧/s。
+- codec 零依赖起步：8-bit μ-law（8KB/s，160B/帧，单包可塞进 ESP-NOW 250B 上限）；音质不够再上 Opus（24kbps，只换编解码层）。
+- μ-law 码本**不要凭记忆手抄**：布局是 sign(1) + segment(3) + quantization(**4** bit，每段 16 级，最高幅度档步长 1024，零码在 0x7F/0xFF)。用参考实现生成表：解码 = 256×int16 LUT；编码 = 128 级升序正幅值表上二分取最近档（解码表的精确逆，互操作性由构造保证）。参考实现用 Python `audioop`，注意 `audioop.ulaw2lin(data, w)` 的 `w` 是**输出**宽度（16bit 传 2；传 1 会静默返回 ±255 截断的 8bit 输出，拿它核对码本会全盘皆错）。
 
 ## 红外 IR（RMT 驱动）
 
