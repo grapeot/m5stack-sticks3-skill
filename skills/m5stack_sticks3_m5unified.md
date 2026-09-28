@@ -90,6 +90,8 @@ Arduino/M5Unified 固件也应提供与 ESP-IDF 路径相同的机器验收能�
 
 按钮逻辑可抽成同时接受 `M5.BtnA`/`M5.BtnB` 事件和 test command 的函数，便于 agent 自动遍历状态机；最终仍要实按 BtnA/BtnB 验证 GPIO 和 Button_Class 行为。显示测试可以由命令切换纯色和布局，但颜色、裁切和闪烁必须在屏幕上验收。进入 light/deep sleep 前应先发送终态、`Serial.flush()`，并保留可恢复路径。
 
+需要人参与的手动测试（按键、说话等）：host 端串口日志必须**先开起来并确认在写**，再请用户操作。串口只在 port 打开期间保留数据，日志窗口与人的操作错位 = 关键数据段（如通话中的收发统计）永久丢失，只能重新刷写重来。
+
 ## 显示
 
 ### 基本用法
@@ -169,6 +171,89 @@ if (M5.BtnA.wasDoubleClicked()) {
   // 选择/确认
 }
 ```
+
+## 音频（M5.Mic / M5.Speaker）
+
+StickS3 音频 = ES8311 codec（I2C 0x18）+ MEMS mic。M5Unified 自动完成功放使能与 ES8311 寄存器配置，不需要手抄（`internal_mic/internal_spk` **默认就是 true**，裸 `M5.begin()` 即就绪；显式置 true 只是保险）：
+
+```cpp
+auto cfg = M5.config();
+cfg.internal_mic = true;   // PDM mic，I2S_NUM_1
+cfg.internal_spk = true;   // I2S DAC + 功放，I2S_NUM_0
+M5.begin(cfg);
+M5.Mic.begin();
+M5.Speaker.begin();
+M5.Speaker.setVolume(200);  // master volume 0-255，默认 64（~25%），语音应用偏低
+```
+
+- mic：标准 I2S（经 ES8311 ADC）输入 **I2S_NUM_1**（data=GPIO16，bck=17，ws=15，mck=18），默认 16kHz，背景 `mic_task`（priority 2）
+- speaker：I2S DAC **I2S_NUM_0**（data=GPIO14，bck/ws/mck 与 mic 共用同一组脚），板型默认 **22050Hz stereo**，背景 `spk_task`（priority 2）做播放与重采样
+- 两路 I2S 独立，可同时采集 + 播放（对讲机/loopback 场景）
+
+### 喇叭使能链（源码事实，"无声"排查必知）
+
+`M5.Speaker.begin()` 触发 `_speaker_enabled_cb_sticks3` 回调（以 `pin_bck==GPIO17` 为门），做两件事：
+
+1. **功放/音频电路上电**：`In_I2C.bitOn(0x6E, 0x11, 0b00001000)` —— **M5PM1 PMIC（I2C 0x6E）寄存器 0x11 的 bit3**。不是 M5IOE1 IO 扩展器的 G3/G10——那是 **M5StopWatch** 的回调（其 DAC 音量还写成 0xEF）。读源码时极易把相邻板型的回调当成 StickS3 的，手动重放"错的序列"会白烧一轮调试。
+2. **ES8311 DAC 配置**（I2C 0x18）：`0x00=0x80`（CSM 上电）、`0x01=0xB5`（MCLK=BCLK）、`0x02=0x18`、`0x0D=0x01`（模拟上电）、`0x12=0x00`（**DAC 上电**）、`0x13=0x10`（输出驱动）、`0x32=0xBF`（DAC 音量 0dB）、`0x37=0x08`（EQ bypass）。
+
+mic 回调与 speaker 回调走**不同的 I2C 通路**：mic 用 `i2c_temporary_switcher_t(1, GPIO47, GPIO48)` 临时切总线再写 ES8311 ADC 寄存器；speaker 直接写默认 `M5.In_I2C`。所以"麦克风正常"≠"speaker 的 I2C 写到达了 ES8311"，也不能反推默认 In_I2C 的端口状态没问题。
+
+回调内部的 `in_i2c_bulk_write` **写失败会被静默吞掉**（只重试、不向上返回，回调照样返回 true）。手动重放使能序列时用公共 API 拿逐寄存器 ACK + 回读：
+
+```cpp
+bool ok1 = M5.In_I2C.bitOn(0x6E, 0x11, 0b00001000, 100000);   // 功放/音频电源
+bool ok2 = M5.In_I2C.writeRegister8(0x18, 0x12, 0x00, 100000); // DAC 上电
+uint8_t rb = M5.In_I2C.readRegister8(0x18, 0x32, 100000);      // 回读确认
+```
+
+**无声排查顺序**（从便宜到贵）：
+1. `arduino-cli lib list` 确认 M5Unified/M5GFX 版本。0.2.19→0.2.23 之间有大量音频修复：0.2.20 修 I2S HW v2（ESP32-S3 等）16-bit PCM 样本顺序、BCK 分频范围、I2S 生命周期加固、Speaker 请求交接竞态；0.2.21 IOExpander 接口源码不兼容；0.2.22 I2C_Class 改用 `driver/i2c_master.h`；0.2.23 Speaker 请求锁。音频顽疾先做"升级到最新（M5GFX 需同步 0.2.30）"的受控 A/B，保留旧版可回退。
+2. 编译日志 `Using library` 行确认实际用的库路径（排除旧副本），运行时打印 `M5.getBoard()` 确认板型。
+3. 按上面的公共 API 拿 PMIC 0x11 bit3 前后值 + ES8311 逐寄存器 ACK/回读，区分"I2C 没到芯片" vs "寄存器到位但 I2S/模拟链问题"。
+4. 仍无声再往信号流下游挖：I2S0 的时钟/数据脚（GPIO18/17/15/14）有无输出、"只播音"与"播音+同时录麦"A/B（两路 I2S 共时钟脚，排除重配冲突）、AW8737 EN/供电。
+5. 交互测试技巧：诊断块放 `loop()` 每几秒重跑（使能+回读+tone），不依赖开机日志对齐；开机/循环放 `tone()` 自测音，听的人只管"听一会儿报有无"。刷写与串口监听不要同窗口：监听占着 port 时 `arduino-cli upload` 会失败（esptool 连接错误），pyserial 报 "multiple access on port"——先刷后监听。
+6. M5Stack 官方文档例子用旧 M5GFX API（`TOPLEFT`/`Display.update()`），现版本要 `TL_DATUM`/`startWrite()`/`endWrite()`。
+
+### 音量与实测响度
+
+**无声根因（实锤）**：`cfg.output_power = false` 关掉 5V boost → AW8737 功放断电 → 喇叭完全无声，而 mic 正常（3V3 音频轨）。对照实验：`output_power` 默认 true 时官方零配置例子（补 `setVolume(128)`）即可发声；使能链本身（PMIC 0x11 bit3 + ES8311 寄存器）ACK/回读全部正常。
+
+实测响度（M5Unified 0.2.19 + core 3.3.8，USB 供电）：master volume 默认 **64/255 ≈ 不可闻**；128/255 可闻但小；255/255 仍 modest——内置是 8Ω 1W 小喇叭（单声道），物理上限低：`playRaw` 满幅（~12000）1kHz 正弦也只有"勉强可闻"级。`tone()` 用库内置 `_default_tone_wav`（低幅度），**不是**上限测量，测上限用 `playRaw` 满幅正弦 + `setVolume(255)`。要更多增益可把 ES8311 `0x32` 从 0xBF（0dB）提到 0xEF（约 +7.5dB，M5StopWatch 用的值）；产品级响度需求直接上外接喇叭。
+
+### M5.Mic — flip-buffer 语义（易错点）
+
+`M5.Mic.record(int16_t* buf, size_t n)` **不是**"阻塞到本 buf 填满"。内部是双缓冲：本次调用**阻塞到上一次请求完成**，然后对新的 buf 发起采集并返回。即 `record()` 返回后可处理的是**上一次调用**请求的 buffer（滞后一帧）：
+
+```cpp
+static int16_t mic[2][320];   // 20ms @16k
+int prev = 0, next = 1;
+M5.Mic.record(mic[0], 320);   // seed（立即返回）
+for (;;) {
+  M5.Mic.record(mic[next], 320);  // 阻塞到 mic[prev] 填满
+  process(mic[prev]);             // 处理上一帧
+  int t = prev; prev = next; next = t;
+}
+```
+
+阻塞式 `record()` 本身就是 ~20ms 节拍器，放在专用 FreeRTOS 任务里不需要额外定时器。降速可用 `setSampleRate()`，或 16k 采集 + 隔点抽取（8k 语音够用）。
+
+### M5.Speaker — playRaw 与虚拟声道
+
+```cpp
+// 支持 int16 与 unsigned 8bit（μ-law 解码结果可直接喂），输入采样率可与输出不同
+M5.Speaker.playRaw(buf16, 160, 8000, /*stereo=*/false, /*repeat=*/1, /*channel=*/0, /*stop=*/false);
+```
+
+- **连续流式必须显式固定 `channel`（如 0）**：`channel=-1` 每次自动选空闲声道，虚拟声道共 8 个，短 chunk 各占一个，播 8 帧左右后全部占满、`playRaw` 返回 false，声音无声消失。复位用 `M5.Speaker.stop(0)`。
+- master volume 默认 **64/255**（约 25%），语音应用建议 200 左右；ES8311 DAC 硬件增益由 M5Unified 配成 0dB，音量全靠这一级数字增益。
+- 输入 8kHz 在 22050Hz I2S 上由 `spk_task` 后台重采样（`sample_rate_x256`），每 chunk 由 I2S 硬件按采样率精确播放——播放端只需保证"不超前"（chunk 间隔 ≥ 20ms，落后由缓冲吸收）。
+
+### 8kHz 语音流式配方（实机验证的起点）
+
+- 20ms/帧（160 样本 @8k），专用播放任务 `vTaskDelay(20ms)` 逐帧喂 `playRaw(channel=0)`；发送端同理 50 帧/s。
+- codec 零依赖起步：8-bit μ-law（8KB/s，160B/帧，单包可塞进 ESP-NOW 250B 上限）；音质不够再上 Opus（24kbps，只换编解码层）。
+- μ-law 码本**不要凭记忆手抄**：布局是 sign(1) + segment(3) + quantization(**4** bit，每段 16 级，最高幅度档步长 1024，零码在 0x7F/0xFF)。用参考实现生成表：解码 = 256×int16 LUT；编码 = 128 级升序正幅值表上二分取最近档（解码表的精确逆，互操作性由构造保证）。参考实现用 Python `audioop`，注意 `audioop.ulaw2lin(data, w)` 的 `w` 是**输出**宽度（16bit 传 2；传 1 会静默返回 ±255 截断的 8bit 输出，拿它核对码本会全盘皆错）。
 
 ## 红外 IR（RMT 驱动）
 

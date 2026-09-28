@@ -45,6 +45,8 @@ M5StickS3 和前代 StickC/Plus/Plus2 在硬件上有大量不兼容之处。本
 
 例如 M5GFX 的 StickS3 分支明确给出：`Panel_ST7789`、135x240、offset `(52,40)`、`invert=true`、默认 RGB element order、40MHz write clock、CS=41、RST=21、MOSI=39、SCLK=40、DC=45。若一开始逐项照抄这些事实，就不需要在 RGB/BGR 和 inversion 之间反复猜测。只有源码与实机仍不一致时，才做最小化纯色/引脚实验，并把差异记录下来。
 
+M5Unified 的 API 语义（`Mic_Class`/`Speaker_Class` 的缓冲与节拍、ES8311 寄存器写入时机、board 引脚映射）以本机安装的版本源码为准：sketchbook libraries 目录（macOS 通常 `~/Documents/Arduino/libraries/M5Unified`，`src/utility/` 下是各外设类）；arduino-cli 的 core 安装位置以 `arduino-cli config dump` 的 `data_dir` 为准（macOS 上可能是 `~/Library/Arduino15` 而非默认的 `~/.arduino15`，找不到 core 时先查这里）。写音频/多机协议代码前先读对应类源码确认语义，不要凭 API 名字猜。
+
 ## 硬件概览
 
 ### 芯片与外设
@@ -248,11 +250,13 @@ StickS3 内置 250mAh 电池。**拔插 USB 不会强制重启设备**（电池�
 
 StickS3 不需要 MCU GPIO4 HOLD 来维持主电源。M5PM1 自身管理主电源保持，M5Unified 的 `power_hold` pin 表也不包含 StickS3。这里不要与音频轨的 M5PM1 `LDO_HOLD` 位混淆：后者仍需在纯 ESP-IDF 音频初始化中设置。如果需要软件关机，通过 M5PM1 I2C 命令实现，而不是拉低 GPIO4。
 
+`M5.Power.getBatteryLevel()` 是**即时电池电压 → 百分比的映射（M5PM1），不是库仑计**：USB 供电（充电维持）时读数偏高，改电池带载运行（屏 + WiFi + 音频）后电压 sag，读数明显下降。实例：USB 下稳定 42-47%，拔电后立刻 10%——这是"电池快没电/内阻大"的真实反映，不是读取错误，不要当 bug 修。
+
 ### ES8311 与音频
 
 ES8311 和 MEMS mic 由 `3V3_L3B_AU` 供电，不依赖 EXT_5V。ESP-IDF 裸驱初始化细节（M5PM1 LDO、`esp_codec_dev` 配置、验收方法）见 `m5stack_sticks3_esp_idf.md`。
 
-Arduino/M5Unified 用户不需要手动初始化 ES8311——`M5.begin()` 会自动配置。如需关闭功放（IR 接收前），调 `M5.Speaker.end()`。
+Arduino/M5Unified 用户不需要手动初始化 ES8311：`internal_mic` / `internal_spk` **默认就是 true**，`Speaker.begin()` / `Mic.begin()` 的回调（`tone()` / `record()` 也会惰性触发）完成功放使能 + ES8311 寄存器写入 + I2S 启动。出声的真正前置条件是：① `output_power` 保持默认 **true**——5V boost 给 AW8737 功放供电，关掉则喇叭完全无声（mic 不受影响）；② master volume——默认 64/255 在内置小喇叭上近乎不可闻，实测建议 ≥128；③ 板型检测正确。mic 是标准 I2S 输入（经 ES8311 ADC）走 I2S_NUM_1（data=16），speaker 是 I2S DAC 走 I2S_NUM_0（data=14，默认 22050Hz stereo），共用 bck/ws/mck 引脚，可同时采集与播放。mic/speaker 的 API、缓冲语义、流式播放与音量实测见 `m5stack_sticks3_m5unified.md` 的音频一节。如需关闭功放（IR 接收前），`cfg.internal_spk = false` + `M5.Speaker.end()`。
 
 ### EXT_5V 输出
 
@@ -260,7 +264,7 @@ Arduino/M5Unified 用户不需要手动初始化 ES8311——`M5.begin()` 会自
 M5.Power.setExtOutput(true, m5::ext_none);
 ```
 
-该轨用于 Grove、Hat 和 IR，不给 ES8311 或 MEMS mic 供电。
+该轨用于 Grove、Hat、IR，以及 **AW8737 喇叭功放**：`output_power = false` 时功放断电，喇叭完全无声（麦克风不受影响，它在 3V3 音频轨上）——音频场景保持默认 true。该轨不给 ES8311 或 MEMS mic 供电。
 
 ## 显示
 
@@ -302,6 +306,9 @@ esp_now_register_recv_cb(recv_cb);
 - 两端信道不一致时帧被静默丢弃：没有 disconnect 事件、没有错误日志。排障第一步是两端各自 `esp_wifi_get_channel()` 核对。
 - **禁止跨设备传绝对 `millis()`**：每台设备的 `millis()` 以自己的开机为基准，两台之间的差是任意的（实测可达数十秒），接收端拿对端时间戳与本地相减会无符号下溢，时序/倒计时卡死。只传周期/相位内的相对时间，接收端用本地收包时刻锚定。
 - `esp_now_send()` 的返回值只表示提交给 driver，不代表对端收到；需要可靠性时应用层自己加序列号/心跳，或升级到加密单播 + 应用层认证的重型方案。
+- **高频数据（~50 pkt/s 音频帧等）不要在回调里只置标志**：单槽标志 + 主循环处理会在丢包率放大到不可用（loop 周期 ≥ 包间隔时旧包未处理就被新包覆盖）。回调里直接写 SPSC 环形缓冲（单生产者 = ESP-NOW 任务，单消费者 = 专用播放/处理任务，head/tail 索引无锁，满了覆盖最旧 + 计数）+ 序列号；"memcpy + 置标志"模式只留给低频控制消息。
+- `esp_now_recv_info_t.rx_ctrl` 是**指针**（`wifi_pkt_rx_ctrl_t *`）：RSSI 取 `info->rx_ctrl->rssi`，点访问直接编译错误。
+- **周期包携带状态副本时，事件路径必须在两端都真的被处理**：否则周期包里的 stale 副本会按周期覆盖对端的新鲜本地状态（实例：1Hz 心跳携带按钮态，但收端没处理按钮事件包 → 本地 hold 状态每秒被 stale 0 覆盖一次，屏幕每秒闪一帧默认画面）。协议评审时逐条检查"每条事件路径在两个角色上都落地"。
 
 ## 已知陷阱汇总
 
@@ -351,6 +358,21 @@ esp_now_register_recv_cb(recv_cb);
 | 全屏 `fillScreen` 每秒重刷 | 整屏闪烁，SPI 带宽被 HUD 刷新吃满 | `fillScreen` 只在换色时做；数字/电量用固定区域 `fillRect` 清底后局部重绘 |
 | 数字位数变化不清底 | "20"→"9" 后残留旧位 ghost 数字 | 先 `fillRect` 按最大位数清固定区域再画；角落锚定用 `TR_DATUM`/`TL_DATUM` |
 | 关外设后怀疑电量读坏了 | `cfg.output_power = false` 后以为 `getBatteryLevel()` 失效 | 电量走 M5PM1 I2C，与 EXT 5V 输出轨开关无关，全外设关闭后电量照读 |
+| 喇叭无声先怀疑"忘了开 audio" / 音量没设 | 排查方向跑偏 | `internal_spk/internal_mic` 默认就是 true，裸 `M5.begin()` 官方例子即可发声；无声要按 M5Unified 子 skill 的使能链排查顺序走（版本 A/B → 库路径/板型 → PMIC 0x11 bit3 与 ES8311 寄存器 ACK/回读 → I2S 信号流）；master volume 默认 64/255 也常被忽略 |
+| 连续 `playRaw` 用 `channel=-1` 自动选声道 | 播 8 帧左右后突然没声 | 虚拟声道只有 8 个，短 chunk 各占一个，占满后 `playRaw` 失败；连续流式必须固定 `channel=0` 并 `stop(0)` 复位 |
+| `M5.Mic.record(buf, n)` 当成"阻塞到本 buf 填满" | 处理到的永远是上一帧或空 buffer，节拍错乱 | 双缓冲 flip 语义：本次调用阻塞到**上一次**请求完成才返回；处理的是上一次 `record` 的 buf（滞后一帧），阻塞本身即 ~20ms 节拍器 |
+| `info->rx_ctrl.rssi` 点访问 | 编译错误（`rx_ctrl` 是指针类型） | `info->rx_ctrl->rssi`（`wifi_pkt_rx_ctrl_t *`） |
+| 凭记忆手抄 G.711 μ-law 编解码 | 声音全糊或编解码互相不认（μ-law 是 sign(1)+seg(3)+quant(**4** bit)，每段 16 级，不是 3-bit mantissa） | 用参考实现（Python `audioop`）生成解码 LUT + 128 级正幅值表（编码=查表取最近档）；注意 `audioop.ulaw2lin(data, w)` 的 `w` 是**输出**宽度，16bit 要传 2，传 1 会静默返回 ±255 截断的 8bit，核对码本时全盘皆错 |
+| 周期包（心跳/相位包）携带状态副本，事件路径只在一端实现 | 对端新鲜本地状态被 stale 副本按周期覆盖，表现为周期性单帧闪烁/状态回跳 | 协议评审逐条核对每条事件路径在两个角色上都被处理（实例：ESP-NOW 按钮联动，controller 不处理 BTN 包 → 相位包里的 stale 按钮态每秒覆盖 follower 的 hold 态） |
+| 固定坐标画单位符号 + 位数可变的数字（如 "100%"） | 三位数时单位叠在末位数字上，糊掉误读（看着像 "10%"） | 数字右对齐（`TR_DATUM`）、单位符号固定在右缘，`fillRect` 区域按最大位数留宽 |
+| 人机交互测试的串口监听窗口与实际操作没对齐 | 关键数据段（如通话中的收发统计）全部丢失，无法定位是发端还是收端的问题 | host 端日志先开、确认在跑，再让用户操作；串口只在 port 打开期间保留数据，窗口错过即永久丢失 |
+| 把相邻板型的音频回调当成 StickS3 的（M5StopWatch 的 G3/G10 + 0xEF 序列） | 手动重放"看似正确"的使能序列仍无声，白烧一轮调试 | StickS3 功放 = M5PM1（0x6E）寄存器 0x11 bit3，DAC 音量 0x32=0xBF；重放前先核对回调函数名（`_speaker_enabled_cb_sticks3`）与所在板型 case 块 |
+| 用 `in_i2c_bulk_write` 同款方式手配 codec 寄存器后假设"写过了" | 写失败被静默吞掉，"执行了" ≠ "到达芯片了" | 用公共 API 拿逐寄存器 ACK + 回读：`M5.In_I2C.writeRegister8/bitOn/readRegister8`；注意 mic 回调走临时 switcher（bus 1/47/48）、speaker 回调走默认 In_I2C，两条通路不等价 |
+| 喇叭完全无声（连官方零配置例子都无声）先怀疑硬件 | 两台同无声 = 大概率共同软件原因（库版本/使能链），换硬件前浪费预算 | 先 `arduino-cli lib list` 查 M5Unified/M5GFX 版本并做升级 A/B；"无声" ≠ 功放坏，常见是 ES8311 DAC 未上电（0x12）/PMIC bit3 未置位/I2S TX 未起 |
+| 串口监听与刷写同窗口进行 | `arduino-cli upload` 失败（esptool 连接错误 exit 2），pyserial 报 "multiple access on port"，开机日志丢失 | 先刷写、后开监听；或把诊断块放 `loop()` 每几秒重跑，不依赖开机时序 |
+| 照抄 M5Stack 官方文档例子里的显示 API | 编译错误（`TOPLEFT`/`Display.update()` 未声明） | 旧 M5GFX API；现版本用 `TL_DATUM`/`TR_DATUM` + `startWrite()`/`endWrite()` |
+| 省电思路设 `cfg.output_power = false` | 喇叭完全无声（音量 200 也无声），而 mic 正常、其余全正常，很难猜到是电源轨 | 5V boost（EXT_5V）给 AW8737 功放供电：需要喇叭就保持默认 `output_power = true`；mic/ES8311 在 3V3 音频轨，不受该开关影响 |
+| 用 `tone()` 或默认音量判断"喇叭有没有声/最大声量" | 默认音量 64/255 在 1W 小喇叭上近乎不可闻，`tone()` 又是库内置低幅度 wav，容易误判成无声/功放坏 | 用 `playRaw` 满幅正弦（幅度 ~12000）+ `setVolume(255)` 做上限测量；内置 8Ω 1W 小喇叭物理上限就低，满幅也只到"可闻"级，产品要响直接上外接喇叭 |
 
 ## 参考资源
 
